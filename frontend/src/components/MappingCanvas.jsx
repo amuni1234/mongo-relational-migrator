@@ -352,7 +352,9 @@ function buildLegacyMapping(schema, embeddedIn, collectionNames) {
         table: child.name,
         foreignKey: fk ? fk.column : `${root.name}_id`,
         as: pluralize(child.name),
-        cardinality: "many",
+        // A single-column UNIQUE/PRIMARY KEY constraint on the FK column
+        // means at most one child row per parent (one-to-one).
+        cardinality: fk && fk.unique ? "one" : "many",
       };
     });
     return {

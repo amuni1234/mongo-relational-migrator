@@ -8,7 +8,10 @@
  *       name: "customers",
  *       columns: [{ name, dataType, nullable, isPrimaryKey }],
  *       primaryKey: ["id"],
- *       foreignKeys: [{ column, refTable, refColumn }]
+ *       // `unique` is true when `column` is covered by a single-column
+ *       // UNIQUE or PRIMARY KEY constraint on this table, i.e. the FK
+ *       // relationship is one-to-one/one-to-zero rather than one-to-many.
+ *       foreignKeys: [{ column, refTable, refColumn, unique }]
  *     },
  *     ...
  *   ]
@@ -65,6 +68,19 @@ async function introspectPostgres(connectionConfig) {
         AND tc.table_schema = 'public';
     `);
 
+    const uniqueRes = await client.query(`
+      SELECT
+        tc.table_name       AS table_name,
+        tc.constraint_name  AS constraint_name,
+        kcu.column_name     AS column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema = kcu.table_schema
+      WHERE tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY')
+        AND tc.table_schema = 'public';
+    `);
+
     return buildSchema(columnsRes.rows, fkRes.rows, {
       table: "table_name",
       column: "column_name",
@@ -75,7 +91,11 @@ async function introspectPostgres(connectionConfig) {
       fkRefTable: "ref_table",
       fkRefColumn: "ref_column",
       nullableTrueValue: "YES",
-    });
+    }, buildSingleColumnUniqueSets(uniqueRes.rows, {
+      table: "table_name",
+      constraint: "constraint_name",
+      column: "column_name",
+    }));
   } finally {
     await client.end();
   }
@@ -114,6 +134,22 @@ async function introspectMysql(connectionConfig) {
       [connectionConfig.database]
     );
 
+    const [uniqueRows] = await conn.execute(
+      `
+      SELECT
+        tc.TABLE_NAME      AS table_name,
+        tc.CONSTRAINT_NAME AS constraint_name,
+        kcu.COLUMN_NAME    AS column_name
+      FROM information_schema.TABLE_CONSTRAINTS tc
+      JOIN information_schema.KEY_COLUMN_USAGE kcu
+        ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+       AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+      WHERE tc.CONSTRAINT_TYPE IN ('UNIQUE', 'PRIMARY KEY')
+        AND tc.TABLE_SCHEMA = ?;
+      `,
+      [connectionConfig.database]
+    );
+
     const normalizedColumns = columns.map((c) => ({
       ...c,
       is_primary_key: c.column_key === "PRI",
@@ -129,13 +165,43 @@ async function introspectMysql(connectionConfig) {
       fkRefTable: "ref_table",
       fkRefColumn: "ref_column",
       nullableTrueValue: "YES",
-    });
+    }, buildSingleColumnUniqueSets(uniqueRows, {
+      table: "table_name",
+      constraint: "constraint_name",
+      column: "column_name",
+    }));
   } finally {
     await conn.end();
   }
 }
 
-function buildSchema(columnRows, fkRows, keys) {
+// Groups constraint rows by (table, constraint) to find constraints that
+// cover exactly one column — those are the ones that make a FK column
+// unique (and so the relationship one-to-one rather than one-to-many).
+// Multi-column constraints don't make any single column in them unique on
+// its own, so they're intentionally excluded.
+function buildSingleColumnUniqueSets(rows, keys) {
+  const constraints = new Map();
+  for (const row of rows) {
+    const constraintName = row[keys.constraint];
+    if (!constraints.has(constraintName)) {
+      constraints.set(constraintName, { table: row[keys.table], columns: new Set() });
+    }
+    constraints.get(constraintName).columns.add(row[keys.column]);
+  }
+
+  const uniqueSingleColumnsByTable = new Map();
+  for (const { table: tableName, columns } of constraints.values()) {
+    if (columns.size !== 1) continue;
+    if (!uniqueSingleColumnsByTable.has(tableName)) {
+      uniqueSingleColumnsByTable.set(tableName, new Set());
+    }
+    uniqueSingleColumnsByTable.get(tableName).add([...columns][0]);
+  }
+  return uniqueSingleColumnsByTable;
+}
+
+function buildSchema(columnRows, fkRows, keys, uniqueSingleColumnsByTable = new Map()) {
   const tableMap = new Map();
 
   for (const row of columnRows) {
@@ -162,10 +228,13 @@ function buildSchema(columnRows, fkRows, keys) {
   for (const row of fkRows) {
     const table = tableMap.get(row[keys.table]);
     if (!table) continue;
+    const fkColumn = row[keys.fkColumn];
+    const uniqueColumns = uniqueSingleColumnsByTable.get(row[keys.table]);
     table.foreignKeys.push({
-      column: row[keys.fkColumn],
+      column: fkColumn,
       refTable: row[keys.fkRefTable],
       refColumn: row[keys.fkRefColumn],
+      unique: Boolean(uniqueColumns && uniqueColumns.has(fkColumn)),
     });
   }
 

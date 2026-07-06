@@ -62,7 +62,10 @@ function suggestMapping(schema) {
         table: t.name,
         foreignKey: fksToRoot[0].column,
         as: pluralize(t.name),
-        cardinality: "many", // default; user can change to "one" in the UI
+        // Inferred from a single-column UNIQUE/PRIMARY KEY constraint on the
+        // FK column: if present, at most one child row exists per parent
+        // (one-to-one), otherwise it's one-to-many. User can override in the UI.
+        cardinality: fksToRoot[0].unique ? "one" : "many",
       };
 
       if (suggestion === "embed") embeds.push(entry);
