@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../api";
 
 const DEFAULT_SAMPLE = JSON.stringify(
@@ -17,6 +17,24 @@ export default function TestLoadPanel({ collectionName }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
+
+  // Prefill from the backend's own .env (MONGODB_URI / MONGODB_DB) so a
+  // real connection string doesn't need to be retyped into the browser
+  // each time. Only overrides the field if it's still at its hardcoded
+  // default -- won't clobber something the user already typed in.
+  useEffect(() => {
+    api
+      .mongoDefaults()
+      .then(({ uri: defaultUri, database: defaultDatabase }) => {
+        if (defaultUri) {
+          setUri((current) => (current === "mongodb://localhost:27017" ? defaultUri : current));
+        }
+        if (defaultDatabase) {
+          setDatabase((current) => (current === "migrator_test" ? defaultDatabase : current));
+        }
+      })
+      .catch(() => {}); // no .env defaults configured -- keep the hardcoded fallback
+  }, []);
 
   async function runTestLoad() {
     setError(null);

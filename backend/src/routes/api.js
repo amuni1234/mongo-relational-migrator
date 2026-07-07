@@ -7,6 +7,20 @@ const { testLoad } = require("../mongoLoader");
 const router = express.Router();
 
 /**
+ * GET /api/mongo-defaults
+ * -> { uri, database }
+ * Lets the frontend prefill the test-load / Glue job Mongo fields from the
+ * backend's own .env instead of the user retyping a connection string
+ * (which may contain credentials) into the browser each time.
+ */
+router.get("/mongo-defaults", (req, res) => {
+  res.json({
+    uri: process.env.MONGODB_URI || "",
+    database: process.env.MONGODB_DB || "",
+  });
+});
+
+/**
  * POST /api/introspect
  * body: { dbType: "postgres" | "mysql", connection: {...driver config} }
  * -> { tables: [...] }
