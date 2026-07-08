@@ -72,6 +72,17 @@ npm install
 npm run dev             # http://localhost:4000
 ```
 
+### API docs / testing endpoints in isolation
+
+With the backend running, open **http://localhost:4000/api-docs** for an
+interactive Swagger UI covering all 5 endpoints (`introspect`,
+`suggest-mapping`, `generate-glue-job`, `test-load`, `mongo-defaults`), each
+with a realistic example payload pre-filled. Useful for testing one stage of
+the pipeline directly — e.g. hitting `/api/suggest-mapping` on its own with a
+hand-edited schema to check the cardinality inference, without going through
+the introspect step or the wizard UI at all. The spec lives at
+`backend/openapi.json`.
+
 **Frontend**
 ```bash
 cd frontend

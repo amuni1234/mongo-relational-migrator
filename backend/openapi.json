@@ -1,0 +1,291 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Relational → MongoDB Migrator API",
+    "version": "1.0.0",
+    "description": "Introspects a relational schema, suggests an embed/reference document mapping, generates an AWS Glue PySpark job, and test-loads sample documents into MongoDB. Each endpoint below can be exercised independently with \"Try it out\" — useful for testing one stage of the pipeline (e.g. just the cardinality inference in /api/suggest-mapping) without going through the full 5-step wizard UI."
+  },
+  "servers": [{ "url": "/", "description": "This backend (matches whatever host/port you're running it on)" }],
+  "tags": [
+    { "name": "Introspect", "description": "Read a relational schema" },
+    { "name": "Mapping", "description": "Suggest / edit the embed vs. reference document mapping" },
+    { "name": "Glue job", "description": "Generate the PySpark ETL script" },
+    { "name": "Mongo", "description": "Test-load samples and read prefill defaults" },
+    { "name": "Health" }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Liveness check",
+        "responses": {
+          "200": {
+            "description": "Backend is up",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "status": { "type": "string", "example": "ok" } } } } }
+          }
+        }
+      }
+    },
+    "/api/introspect": {
+      "post": {
+        "tags": ["Introspect"],
+        "summary": "Read tables/columns/PKs/FKs/unique-constraints from a Postgres or MySQL source",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IntrospectRequest" },
+              "example": {
+                "dbType": "postgres",
+                "connection": {
+                  "host": "localhost",
+                  "port": 5433,
+                  "user": "postgres",
+                  "password": "test",
+                  "database": "postgres"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Normalized schema",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Schema" } } }
+          },
+          "400": { "description": "Missing dbType/connection", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "500": { "description": "Connection or query failure", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/suggest-mapping": {
+      "post": {
+        "tags": ["Mapping"],
+        "summary": "Auto-suggest embed vs. reference + one/many cardinality for every foreign key",
+        "description": "Single-FK, non-\"high-growth\"-named tables are suggested as embeds; multi-FK tables or high-growth names (transaction/order/log/event/interaction/audit/history) default to reference. Cardinality is \"one\" when the FK column has a single-column UNIQUE/PRIMARY KEY constraint, otherwise \"many\".",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "required": ["schema"], "properties": { "schema": { "$ref": "#/components/schemas/Schema" } } },
+              "example": {
+                "schema": {
+                  "tables": [
+                    { "name": "customers", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }], "primaryKey": ["id"], "foreignKeys": [] },
+                    { "name": "customer_profiles", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "column": "customer_id", "refTable": "customers", "refColumn": "id", "unique": true }] },
+                    { "name": "addresses", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "column": "customer_id", "refTable": "customers", "refColumn": "id", "unique": false }] },
+                    { "name": "orders", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "column": "customer_id", "refTable": "customers", "refColumn": "id", "unique": false }] }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Suggested mapping", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Mapping" } } } },
+          "400": { "description": "Missing schema", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/generate-glue-job": {
+      "post": {
+        "tags": ["Glue job"],
+        "summary": "Render the mapping into a runnable Glue 4.0 PySpark script",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["jdbc", "mongo", "schema", "mapping"],
+                "properties": {
+                  "jdbc": { "$ref": "#/components/schemas/JdbcConfig" },
+                  "mongo": { "$ref": "#/components/schemas/MongoTarget" },
+                  "schema": { "$ref": "#/components/schemas/Schema" },
+                  "mapping": { "$ref": "#/components/schemas/Mapping" }
+                }
+              },
+              "example": {
+                "jdbc": { "url": "jdbc:postgresql://localhost:5433/postgres", "user": "postgres", "driver": "org.postgresql.Driver", "passwordSecretName": "test-secret" },
+                "mongo": { "uri": "mongodb://localhost:27017", "database": "migrator_test" },
+                "schema": { "tables": [] },
+                "mapping": { "collections": [] }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Generated script",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "script": { "type": "string", "description": "Full PySpark source" } } } } }
+          },
+          "400": { "description": "Missing jdbc/mongo/schema/mapping", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/test-load": {
+      "post": {
+        "tags": ["Mongo"],
+        "summary": "Clear a scratch collection and insert hand-authored sample documents",
+        "description": "Does not read from the relational source -- purely for eyeballing whether a document shape looks right in real MongoDB before trusting the generated Glue job.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["uri", "database", "collection", "documents"],
+                "properties": {
+                  "uri": { "type": "string" },
+                  "database": { "type": "string" },
+                  "collection": { "type": "string" },
+                  "documents": { "type": "array", "items": { "type": "object" } }
+                }
+              },
+              "example": {
+                "uri": "mongodb://localhost:27017",
+                "database": "migrator_test",
+                "collection": "customers",
+                "documents": [
+                  {
+                    "id": 1,
+                    "name": "Ada Lovelace",
+                    "email": "ada@example.com",
+                    "addresses": [{ "id": 1, "street": "12 Analytical Engine Way", "city": "London" }],
+                    "customer_profiles": { "id": 1, "bio": "Mathematician", "loyalty_tier": "gold" }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Insert result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "insertedCount": { "type": "integer" },
+                    "totalInCollection": { "type": "integer" },
+                    "sample": { "type": "array", "items": { "type": "object" }, "description": "Up to 5 documents read back from the collection" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing uri/database/collection/documents", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "500": { "description": "Mongo connection/write failure", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/mongo-defaults": {
+      "get": {
+        "tags": ["Mongo"],
+        "summary": "Read the backend's MONGODB_URI/MONGODB_DB env vars",
+        "description": "Used by the Test Load panel to prefill its fields instead of requiring the user to retype a connection string each session.",
+        "responses": {
+          "200": {
+            "description": "Configured defaults (empty strings if unset)",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "uri": { "type": "string" }, "database": { "type": "string" } } } } }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Error": { "type": "object", "properties": { "error": { "type": "string" } } },
+      "Connection": {
+        "type": "object",
+        "required": ["host", "port", "user", "database"],
+        "properties": {
+          "host": { "type": "string" },
+          "port": { "type": "integer" },
+          "user": { "type": "string" },
+          "password": { "type": "string" },
+          "database": { "type": "string" }
+        }
+      },
+      "IntrospectRequest": {
+        "type": "object",
+        "required": ["dbType", "connection"],
+        "properties": {
+          "dbType": { "type": "string", "enum": ["postgres", "mysql"] },
+          "connection": { "$ref": "#/components/schemas/Connection" }
+        }
+      },
+      "Column": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "dataType": { "type": "string" },
+          "nullable": { "type": "boolean" },
+          "isPrimaryKey": { "type": "boolean" }
+        }
+      },
+      "ForeignKey": {
+        "type": "object",
+        "properties": {
+          "column": { "type": "string" },
+          "refTable": { "type": "string" },
+          "refColumn": { "type": "string" },
+          "unique": { "type": "boolean", "description": "True when this column has a single-column UNIQUE/PRIMARY KEY constraint -- drives the one/many cardinality inference" }
+        }
+      },
+      "Table": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "columns": { "type": "array", "items": { "$ref": "#/components/schemas/Column" } },
+          "primaryKey": { "type": "array", "items": { "type": "string" } },
+          "foreignKeys": { "type": "array", "items": { "$ref": "#/components/schemas/ForeignKey" } }
+        }
+      },
+      "Schema": {
+        "type": "object",
+        "properties": { "tables": { "type": "array", "items": { "$ref": "#/components/schemas/Table" } } }
+      },
+      "MappingEntry": {
+        "type": "object",
+        "properties": {
+          "table": { "type": "string" },
+          "foreignKey": { "type": "string" },
+          "as": { "type": "string" },
+          "cardinality": { "type": "string", "enum": ["one", "many"] },
+          "strategy": { "type": "string", "enum": ["reference"], "description": "Present only on entries in \"references\"" }
+        }
+      },
+      "Collection": {
+        "type": "object",
+        "properties": {
+          "collectionName": { "type": "string" },
+          "rootTable": { "type": "string" },
+          "primaryKey": { "type": "array", "items": { "type": "string" } },
+          "embeds": { "type": "array", "items": { "$ref": "#/components/schemas/MappingEntry" } },
+          "references": { "type": "array", "items": { "$ref": "#/components/schemas/MappingEntry" } }
+        }
+      },
+      "Mapping": {
+        "type": "object",
+        "properties": { "collections": { "type": "array", "items": { "$ref": "#/components/schemas/Collection" } } }
+      },
+      "JdbcConfig": {
+        "type": "object",
+        "required": ["url", "user", "driver"],
+        "properties": {
+          "url": { "type": "string", "example": "jdbc:postgresql://localhost:5433/postgres" },
+          "user": { "type": "string" },
+          "driver": { "type": "string", "example": "org.postgresql.Driver" },
+          "passwordSecretName": { "type": "string", "description": "AWS Secrets Manager secret name resolved at Glue runtime" }
+        }
+      },
+      "MongoTarget": {
+        "type": "object",
+        "required": ["uri", "database"],
+        "properties": { "uri": { "type": "string" }, "database": { "type": "string" } }
+      }
+    }
+  }
+}
