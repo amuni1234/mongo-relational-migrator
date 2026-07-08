@@ -44,10 +44,10 @@ curl -sf "${BACKEND_URL}/api/generate-glue-job" -H 'content-type: application/js
   \"mongo\": {\"uri\": \"${MONGO_URI}\", \"database\": \"${MONGO_DATABASE}\"},
   \"schema\": $SCHEMA,
   \"mapping\": $MAPPING
-}" | python3 -c "import json,sys; print(json.load(sys.stdin)['script'])" > "$OUT_DIR/glue_job.py"
+}" | python -c "import json,sys; print(json.load(sys.stdin)['script'])" > "$OUT_DIR/glue_job.py"
 
 echo "==> Swapping Secrets Manager for a local env var (test-only; real generator output is untouched)"
-python3 "$SCRIPT_DIR/make_local_test_variant.py" "$OUT_DIR/glue_job.py" "$OUT_DIR/glue_job_local_test.py"
+python "$SCRIPT_DIR/make_local_test_variant.py" "$OUT_DIR/glue_job.py" "$OUT_DIR/glue_job_local_test.py"
 
 echo "==> Running the script in AWS's own Glue 4.0 container (no AWS account needed)"
 docker run --rm \
