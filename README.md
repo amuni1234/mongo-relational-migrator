@@ -9,7 +9,11 @@ what Relational Migrator's single-job engine handles.
 1. **Connect** to a relational source (PostgreSQL or MySQL) and introspect its
    schema (tables, columns, primary keys, foreign keys, and single-column
    unique constraints).
-2. **Review the schema** the tool found.
+2. **Review the schema** the tool found — including a suggested target BSON
+   type per column (editable), and the option to manually declare a
+   **synthetic foreign key** for relationships the source database doesn't
+   enforce as a real constraint. See
+   [Synthetic foreign keys and BSON type mapping](#synthetic-foreign-keys-and-bson-type-mapping).
 3. **Design the document mapping** — for every foreign-key relationship,
    choose *embed* (nest the child inside the parent document) or *reference*
    (keep it as its own collection). The tool suggests a sensible starting
@@ -17,7 +21,8 @@ what Relational Migrator's single-job engine handles.
    suggested for embedding; fast-growing or independently-related tables
    (like `transactions`, `orders`, `logs`) default to reference. It also
    infers **cardinality** (`one` vs `many`) per embed from unique
-   constraints — see [Embed/reference and cardinality heuristics](#embedreference-and-cardinality-heuristics).
+   constraints, shown as an editable one/many toggle — see
+   [Embed/reference and cardinality heuristics](#embedreference-and-cardinality-heuristics).
 4. **Generate an AWS Glue job** — a ready-to-upload PySpark script (Glue 4.0)
    that reads each table via JDBC, joins/nests the embedded children with
    `collect_list(struct(...))` (or a single `struct(...)` for one-to-one
@@ -41,6 +46,7 @@ mongo-relational-migrator/
 │   └── src/
 │       ├── introspect.js            (Postgres + MySQL schema reader)
 │       ├── schemaMapper.js          (embed/reference + cardinality auto-suggestion)
+│       ├── bsonTypeMapper.js        (source SQL type -> BSON type -> Spark cast type)
 │       ├── generators/
 │       │   └── glueJobGenerator.js  (emits the PySpark Glue script)
 │       ├── mongoLoader.js           (sample-document test load)
@@ -150,13 +156,38 @@ cards in the Mapping step's canvas:
   single-column `UNIQUE` or `PRIMARY KEY` constraint, the relationship is
   one-to-one and the generated script embeds a single nested `struct(...)`;
   otherwise it's one-to-many and the script uses
-  `collect_list(struct(...))` to embed an array.
+  `collect_list(struct(...))` to embed an array. This is shown as a
+  one/many pill toggle next to each embedded block in the Mapping canvas —
+  defaulting to the inferred value, labeled `(auto)`, and switching to
+  `(manual)` once you click the other option. The override only lives in
+  that step's local state (see [Known gaps](#known-gaps) for what that
+  means if you navigate away and back).
 
-**Known gap:** the Mapping canvas UI doesn't yet display which cardinality
-was inferred for each embed (every embedded block is labeled "embedded
-array" regardless), nor is there a manual override control — the correct
-value is computed under the hood and only becomes visible once you look at
-the generated script's `# Embed "..." (one/many)` comments in step 4.
+## Synthetic foreign keys and BSON type mapping
+
+Modeled directly on how MongoDB's real Relational Migrator handles two cases
+our schema-inference can't: relationships the source database doesn't
+enforce as a real constraint, and source SQL types that don't map cleanly to
+a MongoDB type without a human deciding.
+
+- **Synthetic foreign keys** — in the Schema step, "+ Add relationship" on
+  any table lets you declare a relationship (child column → parent
+  table/column) that has no real `FOREIGN KEY` constraint in the source
+  database. Since there's no constraint to detect uniqueness from, you pick
+  "one-to-one" or "one-to-many" directly — that choice becomes the `unique`
+  flag, feeding into the *same* cardinality inference described above
+  unchanged. Synthetic relationships are marked `[synthetic]` and
+  individually removable; real (introspected) foreign keys are not.
+- **Target BSON type per column** — each column shows a suggested BSON type
+  (`string`/`int`/`long`/`double`/`decimal128`/`bool`/`date`), inferred from
+  the source SQL type by `backend/src/bsonTypeMapper.js`, and editable via a
+  dropdown. Columns whose source type wasn't recognized (e.g. `jsonb`,
+  `uuid`, `enum`) fall back to `string` and are visually flagged as a guess
+  rather than a confident match. The generated Glue script casts every
+  column to its BSON type's Spark equivalent immediately after each
+  `read_table(...)` call — including a `date` → Spark `timestamp` (not
+  `date`) mapping, since BSON's `Date` is a full instant and Spark's
+  `DateType` would otherwise silently drop the time component.
 
 ## Using the generated Glue job
 
@@ -241,7 +272,20 @@ What it does:
 - Writes use `mode("overwrite")` — no incremental/idempotent write strategy
 - Postgres introspection hardcodes the `public` schema
 - No check-constraint discovery
-- No manual cardinality override in the Mapping UI, and the canvas mislabels
-  every embed as "embedded array" regardless of inferred cardinality (see
-  [Embed/reference and cardinality heuristics](#embedreference-and-cardinality-heuristics))
-- No persistence — schema/mapping only live in browser memory for the session
+- No persistence — schema/mapping only live in browser memory for the
+  session. Two consequences worth knowing:
+  - The Mapping canvas fully unmounts when you leave that step, so
+    navigating back to the (now-editable) Schema step and forward again
+    silently resets any embed/rename/cardinality-override choices you made.
+  - Re-running introspect (going back to Connect) unconditionally replaces
+    the schema, silently discarding any synthetic foreign keys or BSON type
+    overrides you'd added — no confirmation prompt yet.
+- No SSL/TLS option in the Connect step — most managed databases (RDS,
+  Atlas, etc.) require or prefer it
+- If a child table ends up with two foreign keys to the same parent (easy to
+  create now that synthetic FKs exist), only the first one found is used —
+  silently, with no warning
+- Picking mismatched BSON types for what's logically the same join key on
+  either side of an embed (e.g. parent `id` → `long`, child FK → `int`)
+  isn't flagged — Spark will likely numeric-promote rather than fail, but
+  it's an unchecked correctness risk

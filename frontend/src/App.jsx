@@ -33,6 +33,9 @@ export default function App() {
     setConnection(conn);
     try {
       const result = await api.introspect(type, conn);
+      // TODO: this silently discards any synthetic FKs / BSON type overrides
+      // the user already added to the previous `schema` -- worth a confirm
+      // dialog before overwriting once that becomes a common workflow.
       setSchema(result);
       setStep("schema");
     } catch (err) {
@@ -40,6 +43,44 @@ export default function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function addSyntheticForeignKey(childTableName, fk) {
+    setSchema((prev) => ({
+      ...prev,
+      tables: prev.tables.map((t) =>
+        t.name === childTableName
+          ? { ...t, foreignKeys: [...t.foreignKeys, { ...fk, synthetic: true }] }
+          : t
+      ),
+    }));
+  }
+
+  function removeSyntheticForeignKey(childTableName, index) {
+    setSchema((prev) => ({
+      ...prev,
+      tables: prev.tables.map((t) =>
+        t.name === childTableName
+          ? { ...t, foreignKeys: t.foreignKeys.filter((_, i) => i !== index) }
+          : t
+      ),
+    }));
+  }
+
+  function setColumnBsonType(tableName, columnName, bsonType) {
+    setSchema((prev) => ({
+      ...prev,
+      tables: prev.tables.map((t) =>
+        t.name === tableName
+          ? {
+              ...t,
+              columns: t.columns.map((c) =>
+                c.name === columnName ? { ...c, bsonType } : c
+              ),
+            }
+          : t
+      ),
+    }));
   }
 
   async function handleGenerateGlueJob({ jdbc, mongo }) {
@@ -97,7 +138,13 @@ export default function App() {
       )}
 
       {step === "schema" && (
-        <SchemaTree schema={schema} onContinue={() => setStep("mapping")} />
+        <SchemaTree
+          schema={schema}
+          onAddForeignKey={addSyntheticForeignKey}
+          onRemoveForeignKey={removeSyntheticForeignKey}
+          onChangeColumnBsonType={setColumnBsonType}
+          onContinue={() => setStep("mapping")}
+        />
       )}
 
       {step === "mapping" && (

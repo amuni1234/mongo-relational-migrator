@@ -33,6 +33,9 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
     for (const t of schema.tables) names[t.name] = pluralize(t.name);
     return names;
   });
+  // childTableName -> "one" | "many", only present once the user has
+  // manually overridden the inferred cardinality for that embed.
+  const [cardinalityOverride, setCardinalityOverride] = useState({});
   const [selected, setSelected] = useState(schema.tables[0]?.name || null);
   const [dragOverTable, setDragOverTable] = useState(null);
   const [addPickerOpenFor, setAddPickerOpenFor] = useState(null);
@@ -42,7 +45,7 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
   // even if the user never drags anything.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    onChange(buildLegacyMapping(schema, embeddedIn, collectionNames));
+    onChange(buildLegacyMapping(schema, embeddedIn, collectionNames, cardinalityOverride));
   }, []);
 
   const topLevelTables = schema.tables.filter((t) => !embeddedIn[t.name]);
@@ -68,7 +71,7 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
     if (isDescendantOf(childTable, parentTable)) return; // would create a cycle
     const next = { ...embeddedIn, [childTable]: parentTable };
     setEmbeddedIn(next);
-    emitChange(next, collectionNames);
+    emitChange(next, collectionNames, cardinalityOverride);
     setSelected(parentTable);
   }
 
@@ -76,18 +79,24 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
     const next = { ...embeddedIn };
     delete next[childTable];
     setEmbeddedIn(next);
-    emitChange(next, collectionNames);
+    emitChange(next, collectionNames, cardinalityOverride);
     setSelected(childTable);
   }
 
   function renameCollection(tableName, newName) {
     const next = { ...collectionNames, [tableName]: newName };
     setCollectionNames(next);
-    emitChange(embeddedIn, next);
+    emitChange(embeddedIn, next, cardinalityOverride);
   }
 
-  function emitChange(embedState, nameState) {
-    onChange(buildLegacyMapping(schema, embedState, nameState));
+  function setCardinality(childTable, value) {
+    const next = { ...cardinalityOverride, [childTable]: value };
+    setCardinalityOverride(next);
+    emitChange(embeddedIn, collectionNames, next);
+  }
+
+  function emitChange(embedState, nameState, cardinalityState) {
+    onChange(buildLegacyMapping(schema, embedState, nameState, cardinalityState));
   }
 
   function handleDragStart(e, tableName) {
@@ -177,24 +186,45 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
               <span className="er-col-type">{c.dataType}</span>
             </div>
           ))}
-          {children.map((child) => (
-            <div className="er-embedded-block" key={child.name}>
-              <div className="er-embedded-label">
-                {child.name} <span className="er-muted">[ ] embedded array</span>
-                <button
-                  className="er-unembed-btn"
-                  title="Un-embed"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    unembed(child.name);
-                  }}
-                >
-                  ✕
-                </button>
+          {children.map((child) => {
+            const fk = child.foreignKeys.find((fk) => fk.refTable === table.name);
+            const isOverridden = child.name in cardinalityOverride;
+            const effectiveCardinality =
+              cardinalityOverride[child.name] ?? (fk && fk.unique ? "one" : "many");
+            return (
+              <div className="er-embedded-block" key={child.name}>
+                <div className="er-embedded-label">
+                  {child.name}{" "}
+                  <span className="pill-toggle" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      className={effectiveCardinality === "one" ? "active" : ""}
+                      onClick={() => setCardinality(child.name, "one")}
+                    >
+                      one
+                    </button>
+                    <button
+                      className={effectiveCardinality === "many" ? "active" : ""}
+                      onClick={() => setCardinality(child.name, "many")}
+                    >
+                      many
+                    </button>
+                  </span>{" "}
+                  <span className="er-muted">{isOverridden ? "(manual)" : "(auto)"}</span>
+                  <button
+                    className="er-unembed-btn"
+                    title="Un-embed"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      unembed(child.name);
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+                {renderMongoCard(child, depth + 1)}
               </div>
-              {renderMongoCard(child, depth + 1)}
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     );
@@ -340,7 +370,7 @@ function inferInitialEmbeds(schema) {
 // Converts the visual embeddedIn/collectionNames state back into the
 // { collections: [{ collectionName, rootTable, primaryKey, embeds, references }] }
 // shape the Glue job generator expects, so nothing downstream has to change.
-function buildLegacyMapping(schema, embeddedIn, collectionNames) {
+function buildLegacyMapping(schema, embeddedIn, collectionNames, cardinalityOverride = {}) {
   const tableByName = new Map(schema.tables.map((t) => [t.name, t]));
   const topLevel = schema.tables.filter((t) => !embeddedIn[t.name]);
 
@@ -353,8 +383,9 @@ function buildLegacyMapping(schema, embeddedIn, collectionNames) {
         foreignKey: fk ? fk.column : `${root.name}_id`,
         as: pluralize(child.name),
         // A single-column UNIQUE/PRIMARY KEY constraint on the FK column
-        // means at most one child row per parent (one-to-one).
-        cardinality: fk && fk.unique ? "one" : "many",
+        // means at most one child row per parent (one-to-one) -- unless
+        // the user explicitly overrode it in the UI.
+        cardinality: cardinalityOverride[child.name] ?? (fk && fk.unique ? "one" : "many"),
       };
     });
     return {

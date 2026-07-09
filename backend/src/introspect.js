@@ -6,12 +6,20 @@
  *   tables: [
  *     {
  *       name: "customers",
- *       columns: [{ name, dataType, nullable, isPrimaryKey }],
+ *       // `bsonType` is a suggested target MongoDB/BSON type inferred from
+ *       // `dataType` (see bsonTypeMapper.js) -- editable by the user in the
+ *       // Schema step; introspect() only ever sets the inferred default.
+ *       // `bsonTypeConfident` is false when dataType wasn't recognized and
+ *       // the "string" fallback was used.
+ *       columns: [{ name, dataType, nullable, isPrimaryKey, bsonType, bsonTypeConfident }],
  *       primaryKey: ["id"],
  *       // `unique` is true when `column` is covered by a single-column
  *       // UNIQUE or PRIMARY KEY constraint on this table, i.e. the FK
  *       // relationship is one-to-one/one-to-zero rather than one-to-many.
- *       foreignKeys: [{ column, refTable, refColumn, unique }]
+ *       // `synthetic` (added by the UI, never set by introspect() itself)
+ *       // marks a relationship the user manually declared because no real
+ *       // FK constraint exists in the source database for it.
+ *       foreignKeys: [{ column, refTable, refColumn, unique, synthetic }]
  *     },
  *     ...
  *   ]
@@ -24,6 +32,7 @@
 
 const { Client } = require("pg");
 const mysql = require("mysql2/promise");
+const { inferDefaultBsonType } = require("./bsonTypeMapper");
 
 async function introspectPostgres(connectionConfig) {
   const client = new Client(connectionConfig);
@@ -216,11 +225,17 @@ function buildSchema(columnRows, fkRows, keys, uniqueSingleColumnsByTable = new 
     }
     const table = tableMap.get(tableName);
     const isPk = row[keys.isPk] === true || row[keys.isPk] === 1;
+    const { bsonType, confident } = inferDefaultBsonType(row[keys.dataType]);
     table.columns.push({
       name: row[keys.column],
       dataType: row[keys.dataType],
       nullable: row[keys.nullable] === keys.nullableTrueValue,
       isPrimaryKey: isPk,
+      bsonType,
+      // False when dataType wasn't recognized and the "string" fallback was
+      // used -- lets the UI flag a guess instead of presenting it as if it
+      // were a confirmed mapping.
+      bsonTypeConfident: confident,
     });
     if (isPk) table.primaryKey.push(row[keys.column]);
   }

@@ -222,7 +222,9 @@
           "name": { "type": "string" },
           "dataType": { "type": "string" },
           "nullable": { "type": "boolean" },
-          "isPrimaryKey": { "type": "boolean" }
+          "isPrimaryKey": { "type": "boolean" },
+          "bsonType": { "type": "string", "enum": ["string", "int", "long", "double", "decimal128", "bool", "date"], "description": "Target BSON type for this column, defaulted from dataType by bsonTypeMapper.js and editable by the user in the Schema step" },
+          "bsonTypeConfident": { "type": "boolean", "description": "False when dataType wasn't recognized and the \"string\" fallback was used -- the UI should flag this as a guess rather than a confirmed mapping" }
         }
       },
       "ForeignKey": {
@@ -231,7 +233,8 @@
           "column": { "type": "string" },
           "refTable": { "type": "string" },
           "refColumn": { "type": "string" },
-          "unique": { "type": "boolean", "description": "True when this column has a single-column UNIQUE/PRIMARY KEY constraint -- drives the one/many cardinality inference" }
+          "unique": { "type": "boolean", "description": "True when this column has a single-column UNIQUE/PRIMARY KEY constraint -- drives the one/many cardinality inference" },
+          "synthetic": { "type": "boolean", "description": "True when this FK was manually declared by the user in the Schema step rather than detected from a real database constraint" }
         }
       },
       "Table": {

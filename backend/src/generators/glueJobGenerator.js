@@ -15,8 +15,26 @@
  * --additional-python-modules / connector marketplace connection).
  */
 
+const { bsonTypeToSparkType } = require("../bsonTypeMapper");
+
 function pythonStr(value) {
   return `"${String(value).replace(/"/g, '\\"')}"`;
+}
+
+// Casts every column of a just-read table to its (possibly user-overridden)
+// target BSON type's Spark equivalent, re-aliasing to the same column name
+// so nothing downstream (struct field lists, join-key references) needs to
+// change. Applied unconditionally to every column on every table read --
+// root, embed children, and reference tables -- rather than only when a
+// user diverges from the inferred default, so two logically-identical
+// columns in different tables don't end up cast vs. not depending on
+// whether someone happened to touch a dropdown.
+function castSelectLines(varName, table) {
+  const castExprs = table.columns.map((c) => {
+    const sparkType = bsonTypeToSparkType(c.bsonType);
+    return `col(${pythonStr(c.name)}).cast(${pythonStr(sparkType)}).alias(${pythonStr(c.name)})`;
+  });
+  return `${varName} = ${varName}.select(\n    ${castExprs.join(",\n    ")}\n)`;
 }
 
 function generateGlueJob({ jdbc, mongo, schema, mapping }) {
@@ -103,12 +121,14 @@ job.commit()
 
 function generateCollectionBlock(collection, tableByName) {
   const rootVar = toVar(collection.rootTable);
+  const rootTable = tableByName.get(collection.rootTable);
   const lines = [];
 
   lines.push(`# ---------------------------------------------------------------------------`);
   lines.push(`# Collection: ${collection.collectionName}  (root table: ${collection.rootTable})`);
   lines.push(`# ---------------------------------------------------------------------------`);
   lines.push(`${rootVar} = read_table(${pythonStr(collection.rootTable)})`);
+  if (rootTable) lines.push(castSelectLines(rootVar, rootTable));
 
   let currentVar = rootVar;
 
@@ -131,6 +151,7 @@ function generateCollectionBlock(collection, tableByName) {
     lines.push("");
     lines.push(`# Embed "${embed.table}" as "${embed.as}" (${embed.cardinality})`);
     lines.push(`${childVar} = read_table(${pythonStr(embed.table)})`);
+    lines.push(castSelectLines(childVar, childTable));
 
     if (embed.cardinality === "one") {
       // 1:1 or 1:few-but-flattened -> embed as a single nested object per row.
@@ -157,10 +178,14 @@ function generateCollectionBlock(collection, tableByName) {
   // References: written to their own collection, keeping only the FK
   // (no embedding) so they can be looked up independently at read time.
   for (const ref of collection.references) {
+    const refTable = tableByName.get(ref.table);
+    if (!refTable) continue;
+
     const refVar = toVar(ref.table);
     lines.push("");
     lines.push(`# Reference "${ref.table}" -> kept as its own collection, linked by "${ref.foreignKey}"`);
     lines.push(`${refVar} = read_table(${pythonStr(ref.table)})`);
+    lines.push(castSelectLines(refVar, refTable));
     lines.push(`write_to_mongo(${refVar}, ${pythonStr(pluralizeForVar(ref.table))})`);
   }
 
