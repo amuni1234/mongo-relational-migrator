@@ -66,7 +66,13 @@ export default function SchemaTree({
         </button>
       </span>
 
-      {viewMode === "diagram" && <ErDiagram schema={schema} />}
+      {viewMode === "diagram" && (
+        <ErDiagram
+          schema={schema}
+          onAddForeignKey={onAddForeignKey}
+          onRemoveForeignKey={onRemoveForeignKey}
+        />
+      )}
 
       {viewMode === "list" &&
         schema.tables.map((table) => (

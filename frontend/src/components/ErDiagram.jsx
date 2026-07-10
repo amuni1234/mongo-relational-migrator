@@ -1,19 +1,48 @@
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ErTableCard from "./ErTableCard.jsx";
 import { buildEdges, computeTiers, orderWithinTiers } from "../lib/erDiagramLayout.js";
 
-// Spreads sibling edges evenly across a card's edge width instead of
-// anchoring them all at dead-center, so multiple edges into/out of the same
-// card don't visually overlap into one line.
-function anchorX(pos, index, total) {
-  return pos.x + (pos.width * (index + 1)) / (total + 1);
+// Anchor point on a row's card edge (left/right, not top/bottom) at the
+// row's own vertical center -- lets different columns on the same card
+// naturally land at different points without needing artificial spreading.
+function rowAnchor(rowPos, cardPos, side) {
+  return {
+    x: side === "right" ? cardPos.x + cardPos.width : cardPos.x,
+    y: rowPos.y + rowPos.height / 2,
+  };
 }
 
-export default function ErDiagram({ schema }) {
+// Exit the card that's positioned further left from its right edge, enter
+// the one further right from its left edge (and vice versa) -- a simple
+// left/right routing rule, not full orthogonal routing.
+function pickSides(fromCardPos, toCardPos) {
+  const fromCenter = fromCardPos.x + fromCardPos.width / 2;
+  const toCenter = toCardPos.x + toCardPos.width / 2;
+  return fromCenter <= toCenter
+    ? { fromSide: "right", toSide: "left" }
+    : { fromSide: "left", toSide: "right" };
+}
+
+function bezierPath(fromAnchor, toAnchor, fromSide, toSide, bulge = 60) {
+  const c1x = fromAnchor.x + (fromSide === "right" ? bulge : -bulge);
+  const c2x = toAnchor.x + (toSide === "right" ? bulge : -bulge);
+  return `M ${fromAnchor.x} ${fromAnchor.y} C ${c1x} ${fromAnchor.y}, ${c2x} ${toAnchor.y}, ${toAnchor.x} ${toAnchor.y}`;
+}
+
+export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey }) {
   const containerRef = useRef(null);
   const cardRefs = useRef(new Map());
+  const rowRefs = useRef(new Map()); // key: `${table}::${column}`
+
   const [positions, setPositions] = useState(null);
+  const [rowPositions, setRowPositions] = useState(null);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
+
+  const [dragStart, setDragStart] = useState(null); // { table, column }
+  const [cursorPos, setCursorPos] = useState(null); // { x, y }
+  const [hoverTarget, setHoverTarget] = useState(null); // { table, column }
+  const [pendingConnection, setPendingConnection] = useState(null);
+  const [hoveredEdgeIndex, setHoveredEdgeIndex] = useState(null);
 
   const { edges, selfEdges, tiers } = useMemo(() => {
     const { edges, selfEdges } = buildEdges(schema.tables);
@@ -21,24 +50,39 @@ export default function ErDiagram({ schema }) {
     return { edges, selfEdges, tiers };
   }, [schema]);
 
-  // Measure after render rather than precomputing heights from CSS
-  // constants -- card height varies with column count, and a hand-derived
-  // formula would have to be kept in sync with styles.css by hand forever.
-  // Re-measures once more after web fonts finish loading, since a late font
-  // swap (IBM Plex Sans/Mono) can shift layout by a few px after first paint.
+  // Measure cards relative to .er-diagram (their positioned ancestor), then
+  // rows relative to their own card (each card is itself `position:
+  // relative`, so a row's offsetTop/offsetLeft are naturally relative to
+  // it, not to .er-diagram) -- combine to get each row's absolute position.
   useLayoutEffect(() => {
     function measure() {
-      const next = {};
+      const nextCards = {};
       for (const [name, el] of cardRefs.current) {
         if (!el) continue;
-        next[name] = {
+        nextCards[name] = {
           x: el.offsetLeft,
           y: el.offsetTop,
           width: el.offsetWidth,
           height: el.offsetHeight,
         };
       }
-      setPositions(next);
+      setPositions(nextCards);
+
+      const nextRows = {};
+      for (const [key, el] of rowRefs.current) {
+        if (!el) continue;
+        const table = key.split("::")[0];
+        const cardPos = nextCards[table];
+        if (!cardPos) continue;
+        nextRows[key] = {
+          x: cardPos.x + el.offsetLeft,
+          y: cardPos.y + el.offsetTop,
+          width: el.offsetWidth,
+          height: el.offsetHeight,
+        };
+      }
+      setRowPositions(nextRows);
+
       if (containerRef.current) {
         setCanvasSize({
           width: containerRef.current.scrollWidth,
@@ -50,15 +94,71 @@ export default function ErDiagram({ schema }) {
     document.fonts?.ready?.then(measure);
   }, [schema, tiers]);
 
-  // Group edges by their "from"/"to" card so sibling edges on the same card
-  // can be spread across that card's edge width (see anchorX above).
-  const outgoingGroups = new Map();
-  const incomingGroups = new Map();
-  for (const edge of edges) {
-    if (!outgoingGroups.has(edge.from)) outgoingGroups.set(edge.from, []);
-    outgoingGroups.get(edge.from).push(edge);
-    if (!incomingGroups.has(edge.to)) incomingGroups.set(edge.to, []);
-    incomingGroups.get(edge.to).push(edge);
+  function toContentCoords(e) {
+    const rect = containerRef.current.getBoundingClientRect();
+    return {
+      x: e.clientX - rect.left + containerRef.current.scrollLeft,
+      y: e.clientY - rect.top + containerRef.current.scrollTop,
+    };
+  }
+
+  function handleRowMouseDown(table, column, e) {
+    e.preventDefault();
+    setDragStart({ table, column });
+    setCursorPos(toContentCoords(e));
+  }
+
+  // Global listeners only exist while an actual drag is in progress.
+  useEffect(() => {
+    if (!dragStart) return;
+
+    function handleMouseMove(e) {
+      setCursorPos(toContentCoords(e));
+      const el = document.elementFromPoint(e.clientX, e.clientY)?.closest("[data-table][data-column]");
+      setHoverTarget(el ? { table: el.dataset.table, column: el.dataset.column } : null);
+    }
+
+    function handleMouseUp(e) {
+      const coords = toContentCoords(e);
+      const el = document.elementFromPoint(e.clientX, e.clientY)?.closest("[data-table][data-column]");
+      if (el) {
+        const toTable = el.dataset.table;
+        const toColumn = el.dataset.column;
+        const isSameRow = toTable === dragStart.table && toColumn === dragStart.column;
+        if (!isSameRow) {
+          setPendingConnection({
+            fromTable: dragStart.table,
+            fromColumn: dragStart.column,
+            toTable,
+            toColumn,
+            unique: false,
+            x: coords.x,
+            y: coords.y,
+          });
+        }
+      }
+      setDragStart(null);
+      setCursorPos(null);
+      setHoverTarget(null);
+    }
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dragStart]);
+
+  function confirmConnection() {
+    onAddForeignKey(pendingConnection.fromTable, {
+      column: pendingConnection.fromColumn,
+      refTable: pendingConnection.toTable,
+      refColumn: pendingConnection.toColumn,
+      unique: pendingConnection.unique,
+    });
+    setPendingConnection(null);
   }
 
   return (
@@ -75,13 +175,20 @@ export default function ErDiagram({ schema }) {
                   if (el) cardRefs.current.set(name, el);
                   else cardRefs.current.delete(name);
                 }}
+                onRowRef={(col, el) => {
+                  const key = `${name}::${col}`;
+                  if (el) rowRefs.current.set(key, el);
+                  else rowRefs.current.delete(key);
+                }}
+                onRowMouseDown={(col, e) => handleRowMouseDown(name, col, e)}
+                dragTargetColumn={hoverTarget?.table === name ? hoverTarget.column : null}
               />
             );
           })}
         </div>
       ))}
 
-      {positions && (
+      {positions && rowPositions && (
         <svg className="er-diagram-lines" width={canvasSize.width} height={canvasSize.height}>
           <defs>
             <marker
@@ -98,70 +205,153 @@ export default function ErDiagram({ schema }) {
           </defs>
 
           {edges.map((edge, i) => {
-            const fromPos = positions[edge.from];
-            const toPos = positions[edge.to];
-            if (!fromPos || !toPos) return null;
+            const fromRow = rowPositions[`${edge.from}::${edge.column}`];
+            const toRow = rowPositions[`${edge.to}::${edge.refColumn}`];
+            const fromCard = positions[edge.from];
+            const toCard = positions[edge.to];
+            if (!fromRow || !toRow || !fromCard || !toCard) return null;
 
-            const fromSiblings = outgoingGroups.get(edge.from) || [];
-            const toSiblings = incomingGroups.get(edge.to) || [];
-            const fromIdx = fromSiblings.indexOf(edge);
-            const toIdx = toSiblings.indexOf(edge);
-
-            // Child (from) sits in a lower tier than parent (to) in the
-            // common case, so the edge exits the child's TOP edge and
-            // arrives at the parent's BOTTOM edge. Same-tier edges (only
-            // possible inside a cycle-dump tier) still draw reasonably --
-            // the vertical control-point offset below produces a small arc
-            // rather than a degenerate straight horizontal line.
-            const x1 = anchorX(fromPos, fromIdx, fromSiblings.length);
-            const y1 = fromPos.y;
-            const x2 = anchorX(toPos, toIdx, toSiblings.length);
-            const y2 = toPos.y + toPos.height;
-
-            const dy = Math.max(Math.abs(y1 - y2) / 2, 30);
-            const c1x = x1;
-            const c1y = y1 - dy;
-            const c2x = x2;
-            const c2y = y2 + dy;
+            const { fromSide, toSide } = pickSides(fromCard, toCard);
+            const fromAnchor = rowAnchor(fromRow, fromCard, fromSide);
+            const toAnchor = rowAnchor(toRow, toCard, toSide);
+            const d = bezierPath(fromAnchor, toAnchor, fromSide, toSide);
+            const midX = (fromAnchor.x + toAnchor.x) / 2;
+            const midY = (fromAnchor.y + toAnchor.y) / 2;
 
             return (
               <g key={i}>
                 <path
-                  d={`M ${x1} ${y1} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${x2} ${y2}`}
+                  d={d}
                   className={edge.synthetic ? "er-edge synthetic" : "er-edge"}
                   markerEnd="url(#er-arrow)"
                 />
-                <text x={(x1 + x2) / 2} y={(y1 + y2) / 2} className="er-fk-label">
+                {edge.synthetic && (
+                  <path
+                    d={d}
+                    className="er-edge-hit"
+                    onMouseEnter={() => setHoveredEdgeIndex(i)}
+                    onMouseLeave={() => setHoveredEdgeIndex((cur) => (cur === i ? null : cur))}
+                  />
+                )}
+                <text x={midX} y={midY} className="er-fk-label">
                   {edge.column}
                 </text>
+                {edge.synthetic && hoveredEdgeIndex === i && (
+                  <g
+                    transform={`translate(${midX}, ${midY - 14})`}
+                    className="er-edge-delete"
+                    onClick={() => onRemoveForeignKey(edge.from, edge.fkIndex)}
+                  >
+                    <circle r="8" />
+                    <text textAnchor="middle" dy="3">
+                      ✕
+                    </text>
+                  </g>
+                )}
               </g>
             );
           })}
 
           {selfEdges.map((edge, i) => {
-            const pos = positions[edge.from];
-            if (!pos) return null;
-            // Small loop bulging out from the right edge back to the top
-            // edge -- only needs its own card's bounding box.
-            const x1 = pos.x + pos.width;
-            const y1 = pos.y + pos.height * 0.35;
-            const x2 = pos.x + pos.width * 0.75;
-            const y2 = pos.y;
-            const bulge = 40;
+            const cardPos = positions[edge.from];
+            const fromRow = rowPositions[`${edge.from}::${edge.column}`];
+            const toRow = rowPositions[`${edge.from}::${edge.refColumn}`];
+            if (!cardPos || !fromRow || !toRow) return null;
+
+            const fromAnchor = { x: cardPos.x + cardPos.width, y: fromRow.y + fromRow.height / 2 };
+            const toAnchor = { x: cardPos.x + cardPos.width, y: toRow.y + toRow.height / 2 };
+            const bulge = 50;
+            const d = `M ${fromAnchor.x} ${fromAnchor.y} C ${fromAnchor.x + bulge} ${fromAnchor.y}, ${toAnchor.x + bulge} ${toAnchor.y}, ${toAnchor.x} ${toAnchor.y}`;
+
             return (
               <g key={`self-${i}`}>
                 <path
-                  d={`M ${x1} ${y1} C ${x1 + bulge} ${y1}, ${x2 + bulge} ${y2}, ${x2} ${y2}`}
+                  d={d}
                   className={edge.synthetic ? "er-edge synthetic" : "er-edge"}
                   markerEnd="url(#er-arrow)"
                 />
-                <text x={x1 + bulge / 2} y={(y1 + y2) / 2} className="er-fk-label">
+                {edge.synthetic && (
+                  <path
+                    d={d}
+                    className="er-edge-hit"
+                    onMouseEnter={() => setHoveredEdgeIndex(`self-${i}`)}
+                    onMouseLeave={() =>
+                      setHoveredEdgeIndex((cur) => (cur === `self-${i}` ? null : cur))
+                    }
+                  />
+                )}
+                <text x={fromAnchor.x + bulge / 2} y={(fromAnchor.y + toAnchor.y) / 2} className="er-fk-label">
                   {edge.column}
                 </text>
+                {edge.synthetic && hoveredEdgeIndex === `self-${i}` && (
+                  <g
+                    transform={`translate(${fromAnchor.x + bulge / 2}, ${(fromAnchor.y + toAnchor.y) / 2 - 14})`}
+                    className="er-edge-delete"
+                    onClick={() => onRemoveForeignKey(edge.from, edge.fkIndex)}
+                  >
+                    <circle r="8" />
+                    <text textAnchor="middle" dy="3">
+                      ✕
+                    </text>
+                  </g>
+                )}
               </g>
             );
           })}
+
+          {dragStart &&
+            cursorPos &&
+            (() => {
+              const cardPos = positions[dragStart.table];
+              const rowPos = rowPositions[`${dragStart.table}::${dragStart.column}`];
+              if (!cardPos || !rowPos) return null;
+              const cardCenter = cardPos.x + cardPos.width / 2;
+              const side = cursorPos.x >= cardCenter ? "right" : "left";
+              const anchor = rowAnchor(rowPos, cardPos, side);
+              const bulge = 60;
+              const c1x = anchor.x + (side === "right" ? bulge : -bulge);
+              const d = `M ${anchor.x} ${anchor.y} C ${c1x} ${anchor.y}, ${cursorPos.x} ${cursorPos.y}, ${cursorPos.x} ${cursorPos.y}`;
+              return <path d={d} className="er-edge synthetic dragging" />;
+            })()}
         </svg>
+      )}
+
+      {pendingConnection && (
+        <div
+          className="er-connection-popup"
+          style={{ left: pendingConnection.x, top: pendingConnection.y }}
+        >
+          <div className="hint">
+            {pendingConnection.fromTable}.{pendingConnection.fromColumn} →{" "}
+            {pendingConnection.toTable}.{pendingConnection.toColumn}
+          </div>
+          <span className="pill-toggle" style={{ marginTop: 6 }}>
+            <button
+              className={!pendingConnection.unique ? "active" : ""}
+              onClick={() => setPendingConnection((p) => ({ ...p, unique: false }))}
+            >
+              one-to-many
+            </button>
+            <button
+              className={pendingConnection.unique ? "active" : ""}
+              onClick={() => setPendingConnection((p) => ({ ...p, unique: true }))}
+            >
+              one-to-one
+            </button>
+          </span>
+          <div style={{ marginTop: 8 }}>
+            <button className="btn" onClick={confirmConnection}>
+              Add
+            </button>
+            <button
+              className="btn secondary"
+              style={{ marginLeft: 6 }}
+              onClick={() => setPendingConnection(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );

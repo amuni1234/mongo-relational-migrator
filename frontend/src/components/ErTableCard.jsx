@@ -6,7 +6,10 @@ import { forwardRef } from "react";
 // diagram doesn't need to touch MappingCanvas.jsx at all. Forwards the ref
 // so ErDiagram.jsx can measure its rendered position for drawing connector
 // lines.
-const ErTableCard = forwardRef(function ErTableCard({ table }, ref) {
+const ErTableCard = forwardRef(function ErTableCard(
+  { table, onRowRef, onRowMouseDown, dragTargetColumn },
+  ref
+) {
   return (
     <div className="er-card diagram" ref={ref}>
       <div className="er-card-title">
@@ -14,7 +17,14 @@ const ErTableCard = forwardRef(function ErTableCard({ table }, ref) {
       </div>
       <div className="er-card-body">
         {table.columns.map((c) => (
-          <div className="er-row" key={c.name}>
+          <div
+            className={`er-row${dragTargetColumn === c.name ? " drag-target" : ""}`}
+            key={c.name}
+            data-table={table.name}
+            data-column={c.name}
+            ref={(el) => onRowRef?.(c.name, el)}
+            onMouseDown={(e) => onRowMouseDown?.(c.name, e)}
+          >
             <span className={c.isPrimaryKey ? "er-col-pk" : "er-col-name"}>
               {c.isPrimaryKey ? "🔑 " : ""}
               {c.name}

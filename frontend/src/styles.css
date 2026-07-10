@@ -527,6 +527,60 @@ pre.code-preview {
   text-anchor: middle;
 }
 
+.er-edge.dragging {
+  stroke: var(--mongo-teal);
+}
+
+/* Invisible wide hit-path layered over a visible thin .er-edge so hovering
+   is easy to trigger; only rendered for synthetic edges, matching the rule
+   that only synthetic FKs are removable. */
+.er-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 12;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.er-edge-delete {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.er-edge-delete circle {
+  fill: var(--danger);
+}
+
+.er-edge-delete text {
+  fill: #1a0d0a;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+/* Scoped to the diagram's cards only -- .er-row is shared with
+   MappingCanvas.jsx's cards, which shouldn't be affected by this. */
+.er-card.diagram .er-row {
+  user-select: none;
+}
+
+.er-card.diagram .er-row.drag-target {
+  background: rgba(63, 214, 176, 0.14);
+}
+
+.er-connection-popup {
+  position: absolute;
+  z-index: 5;
+  background: var(--panel-2);
+  border: 1px solid var(--mongo-teal);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  min-width: 220px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
 .er-sidebar {
   background: var(--panel-2);
   border: 1px solid var(--border);

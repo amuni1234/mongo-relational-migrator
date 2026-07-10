@@ -197,9 +197,9 @@ a MongoDB type without a human deciding.
 
 The Schema step has a **List / Diagram** toggle. List is the interactive
 editor described above (BSON types, synthetic FKs) and stays the default;
-Diagram is a read-only visualization of the same schema, built from scratch
-with plain SVG (no graph/diagram library — this project has none, and none
-was added for this).
+Diagram is a visualization of the same schema, built from scratch with plain
+SVG (no graph/diagram library — this project has none, and none was added
+for this) — and is itself editable, not just read-only.
 
 - Tables are laid out in tiers by a simple topological pass over the
   foreign-key graph (`frontend/src/lib/erDiagramLayout.js`): tables with no
@@ -208,16 +208,27 @@ was added for this).
   cycle) get dumped into one final tier so layout always terminates. Tables
   within a tier are then reordered by the average position of their FK
   targets in the tier above, to reduce line crossings.
-- Connector lines are cubic Beziers spread across each card's edge width (so
-  several edges into/out of the same table don't all overlap at one point),
-  drawn **dashed** for synthetic FKs and solid for real ones — mirroring the
-  `[synthetic]` badge already used in List view. Self-referencing FKs (a
-  table pointing at itself) render as a small loop instead of a line.
-- Card positions are measured from the actual rendered DOM
-  (`getBoundingClientRect`-equivalent via `offsetLeft`/`offsetTop`) rather
-  than computed from a height formula, since card height varies with column
-  count — this keeps the diagram correct without having to hand-derive
-  sizing constants that would drift out of sync with `styles.css`.
+- Connector lines anchor at the *actual FK/PK column rows* they connect
+  (not generic card edges), drawn **dashed** for synthetic FKs and solid for
+  real ones — mirroring the `[synthetic]` badge already used in List view.
+  Self-referencing FKs (a table pointing at itself) render as a small loop.
+- **Create a relationship** by dragging from one column row to another —
+  drop it, confirm one-to-one vs. one-to-many (can't be inferred from the
+  drag alone), and it's added as a synthetic FK, identical to using List
+  view's "+ Add relationship" form. Dropping outside any column row cancels
+  cleanly.
+- **Delete a relationship** by hovering a dashed (synthetic) line and
+  clicking the ✕ that appears. Real (non-synthetic) lines aren't
+  interactive — same rule List view already enforces, only synthetic FKs
+  are removable.
+- Changing an existing relationship's cardinality is List-view-only for
+  now — the diagram doesn't have an equivalent control yet.
+- Card and row positions are measured from the actual rendered DOM
+  (`offsetLeft`/`offsetTop`, combined per-row-relative-to-its-own-card)
+  rather than computed from a height formula, since card height varies with
+  column count — this keeps the diagram correct without having to
+  hand-derive sizing constants that would drift out of sync with
+  `styles.css`.
 - No pan/zoom — the diagram container just scrolls. Fine for the tens of
   tables this is meant for; not designed for hundreds.
 

@@ -12,17 +12,21 @@ function buildEdges(tables) {
   const edges = [];
   const selfEdges = [];
   for (const table of tables) {
-    for (const fk of table.foreignKeys) {
+    table.foreignKeys.forEach((fk, fkIndex) => {
       const edge = {
         from: table.name,
         to: fk.refTable,
         column: fk.column,
         refColumn: fk.refColumn,
         synthetic: !!fk.synthetic,
+        // Index within table.foreignKeys -- lets deletion call
+        // onRemoveForeignKey(edge.from, edge.fkIndex) directly, matching
+        // how the List view's remove button already works.
+        fkIndex,
       };
       if (fk.refTable === table.name) selfEdges.push(edge);
       else edges.push(edge);
-    }
+    });
   }
   return { edges, selfEdges };
 }
