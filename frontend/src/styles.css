@@ -485,19 +485,24 @@ pre.code-preview {
   display: flex;
   gap: 24px;
   margin-bottom: 70px;
-  position: relative;
-  z-index: 1;
 }
 
 .er-card.diagram {
   width: 220px;
   flex-shrink: 0;
+  /* Stack above .er-diagram-lines -- position here (not on the tier row)
+     so it doesn't become an offsetParent for measurement purposes; an
+     element's own `position` never affects its own offsetTop/offsetLeft,
+     only an ancestor's does. */
+  position: relative;
+  z-index: 2;
 }
 
 .er-diagram-lines {
   position: absolute;
   top: 0;
   left: 0;
+  z-index: 1;
   pointer-events: none;
 }
 
