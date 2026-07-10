@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "./api";
 import ConnectionForm from "./components/ConnectionForm.jsx";
 import SchemaTree from "./components/SchemaTree.jsx";
@@ -24,7 +24,51 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
+  // Backend-suggested starting mapping (from POST /api/suggest-mapping),
+  // used to seed the MappingCanvas diagram so the diagram reflects the same
+  // embed/reference heuristics the backend actually uses — rather than the
+  // diagram reimplementing its own separate guess client-side.
+  const [suggestedMapping, setSuggestedMapping] = useState(null);
+  const [suggestedMappingLoading, setSuggestedMappingLoading] = useState(false);
+  const [suggestedMappingError, setSuggestedMappingError] = useState(null);
+
   const stepIndex = STEPS.findIndex((s) => s.key === step);
+
+  // Fetch the backend's suggested mapping as soon as we have a schema and
+  // are heading into (or already on) the mapping step, so the diagram has
+  // something to seed itself from instead of guessing locally.
+  useEffect(() => {
+    if (!schema) return;
+    if (step !== "mapping") return;
+    if (suggestedMapping || suggestedMappingLoading) return;
+
+    let cancelled = false;
+    setSuggestedMappingLoading(true);
+    setSuggestedMappingError(null);
+    api
+      .suggestMapping(schema)
+      .then((result) => {
+        if (!cancelled) setSuggestedMapping(result);
+      })
+      .catch((err) => {
+        if (!cancelled) setSuggestedMappingError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setSuggestedMappingLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schema, step]);
+
+  // If the user reconnects / re-introspects, drop any stale suggestion so
+  // the next visit to the mapping step re-fetches for the new schema.
+  useEffect(() => {
+    setSuggestedMapping(null);
+    setSuggestedMappingError(null);
+  }, [schema]);
 
   async function handleIntrospect(type, conn) {
     setError(null);
@@ -33,9 +77,6 @@ export default function App() {
     setConnection(conn);
     try {
       const result = await api.introspect(type, conn);
-      // TODO: this silently discards any synthetic FKs / BSON type overrides
-      // the user already added to the previous `schema` -- worth a confirm
-      // dialog before overwriting once that becomes a common workflow.
       setSchema(result);
       setStep("schema");
     } catch (err) {
@@ -43,44 +84,6 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }
-
-  function addSyntheticForeignKey(childTableName, fk) {
-    setSchema((prev) => ({
-      ...prev,
-      tables: prev.tables.map((t) =>
-        t.name === childTableName
-          ? { ...t, foreignKeys: [...t.foreignKeys, { ...fk, synthetic: true }] }
-          : t
-      ),
-    }));
-  }
-
-  function removeSyntheticForeignKey(childTableName, index) {
-    setSchema((prev) => ({
-      ...prev,
-      tables: prev.tables.map((t) =>
-        t.name === childTableName
-          ? { ...t, foreignKeys: t.foreignKeys.filter((_, i) => i !== index) }
-          : t
-      ),
-    }));
-  }
-
-  function setColumnBsonType(tableName, columnName, bsonType) {
-    setSchema((prev) => ({
-      ...prev,
-      tables: prev.tables.map((t) =>
-        t.name === tableName
-          ? {
-              ...t,
-              columns: t.columns.map((c) =>
-                c.name === columnName ? { ...c, bsonType } : c
-              ),
-            }
-          : t
-      ),
-    }));
   }
 
   async function handleGenerateGlueJob({ jdbc, mongo }) {
@@ -138,18 +141,19 @@ export default function App() {
       )}
 
       {step === "schema" && (
-        <SchemaTree
-          schema={schema}
-          onAddForeignKey={addSyntheticForeignKey}
-          onRemoveForeignKey={removeSyntheticForeignKey}
-          onChangeColumnBsonType={setColumnBsonType}
-          onContinue={() => setStep("mapping")}
-        />
+        <SchemaTree schema={schema} onContinue={() => setStep("mapping")} />
       )}
 
       {step === "mapping" && (
         <MappingCanvas
           schema={schema}
+          suggestedMapping={suggestedMapping}
+          suggestedMappingLoading={suggestedMappingLoading}
+          suggestedMappingError={suggestedMappingError}
+          onRetrySuggestedMapping={() => {
+            setSuggestedMappingError(null);
+            setSuggestedMapping(null);
+          }}
           onChange={setMapping}
           onContinue={() => setStep("glue")}
         />
