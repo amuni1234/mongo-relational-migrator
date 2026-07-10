@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * A visual mapping editor styled after MongoDB Relational Migrator's
@@ -11,6 +11,14 @@ import { useEffect, useMemo, useState } from "react";
  * document). Drop it on the empty canvas area to un-embed it back to its
  * own top-level collection. Everything re-renders live, and the sidebar
  * always reflects the currently selected collection.
+ *
+ * The starting embed layout is seeded from the backend's POST
+ * /api/suggest-mapping response (passed in as `suggestedMapping`), so the
+ * diagram reflects the same heuristics the backend actually uses when it
+ * later generates the Glue job — rather than the diagram guessing on its
+ * own with separate, possibly-drifted logic. If the backend call hasn't
+ * resolved yet, the canvas shows a loading state; if it fails, the user can
+ * retry or fall back to a local heuristic so they're never fully blocked.
  */
 
 function pluralize(name) {
@@ -19,34 +27,96 @@ function pluralize(name) {
   return `${name}s`;
 }
 
-export default function MappingCanvas({ schema, onChange, onContinue }) {
+export default function MappingCanvas({
+  schema,
+  suggestedMapping,
+  suggestedMappingLoading,
+  suggestedMappingError,
+  onRetrySuggestedMapping,
+  onChange,
+  onContinue,
+}) {
   const tableByName = useMemo(
     () => new Map(schema.tables.map((t) => [t.name, t])),
     [schema]
   );
 
   // tableName -> parentTableName it's currently embedded into (or undefined
-  // if it's still its own top-level collection).
-  const [embeddedIn, setEmbeddedIn] = useState(() => inferInitialEmbeds(schema));
-  const [collectionNames, setCollectionNames] = useState(() => {
-    const names = {};
-    for (const t of schema.tables) names[t.name] = pluralize(t.name);
-    return names;
-  });
-  // childTableName -> "one" | "many", only present once the user has
-  // manually overridden the inferred cardinality for that embed.
-  const [cardinalityOverride, setCardinalityOverride] = useState({});
+  // if it's still its own top-level collection). Left null until we've
+  // seeded from either the backend suggestion or the local fallback.
+  const [embeddedIn, setEmbeddedIn] = useState(null);
+  const [collectionNames, setCollectionNames] = useState(null);
+  // Any "reference" entries the backend suggested (e.g. join tables with
+  // more than one FK), keyed by the root collection's table name, so we can
+  // pass them through to the final mapping instead of always emitting [].
+  const [referencesByRoot, setReferencesByRoot] = useState({});
+  const [usingLocalFallback, setUsingLocalFallback] = useState(false);
+
   const [selected, setSelected] = useState(schema.tables[0]?.name || null);
   const [dragOverTable, setDragOverTable] = useState(null);
   const [addPickerOpenFor, setAddPickerOpenFor] = useState(null);
 
-  // Sync the parent's mapping state with our initial (heuristic-seeded)
-  // embed state, so downstream steps see the same thing the canvas shows
-  // even if the user never drags anything.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // Only seed once — either when the backend suggestion first arrives, or
+  // when the user explicitly opts into the local fallback after a failure.
+  const seededRef = useRef(false);
+
   useEffect(() => {
-    onChange(buildLegacyMapping(schema, embeddedIn, collectionNames, cardinalityOverride));
-  }, []);
+    if (seededRef.current) return;
+
+    if (suggestedMapping) {
+      const { embeddedIn: seedEmbeds, collectionNames: seedNames, referencesByRoot: seedRefs } =
+        fromSuggestedMapping(schema, suggestedMapping);
+      seededRef.current = true;
+      setEmbeddedIn(seedEmbeds);
+      setCollectionNames(seedNames);
+      setReferencesByRoot(seedRefs);
+      onChange(buildLegacyMapping(schema, seedEmbeds, seedNames, seedRefs));
+      return;
+    }
+
+    if (usingLocalFallback) {
+      const seedEmbeds = inferInitialEmbeds(schema);
+      const seedNames = {};
+      for (const t of schema.tables) seedNames[t.name] = pluralize(t.name);
+      seededRef.current = true;
+      setEmbeddedIn(seedEmbeds);
+      setCollectionNames(seedNames);
+      setReferencesByRoot({});
+      onChange(buildLegacyMapping(schema, seedEmbeds, seedNames, {}));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [suggestedMapping, usingLocalFallback]);
+
+  // Not seeded yet: either still waiting on the backend, or it failed and
+  // we're waiting on the user to retry or fall back to a local guess.
+  if (!embeddedIn || !collectionNames) {
+    return (
+      <div className="panel">
+        <h2>3. Design the document mapping</h2>
+        {suggestedMappingLoading && (
+          <p className="hint">Fetching a suggested mapping from the backend…</p>
+        )}
+        {!suggestedMappingLoading && suggestedMappingError && (
+          <>
+            <div className="error-banner">
+              Couldn't reach the mapping suggestion service: {suggestedMappingError}
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+              <button className="btn" onClick={onRetrySuggestedMapping}>
+                Retry
+              </button>
+              <button
+                className="btn secondary"
+                onClick={() => setUsingLocalFallback(true)}
+              >
+                Continue with a local guess instead
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
 
   const topLevelTables = schema.tables.filter((t) => !embeddedIn[t.name]);
 
@@ -71,7 +141,7 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
     if (isDescendantOf(childTable, parentTable)) return; // would create a cycle
     const next = { ...embeddedIn, [childTable]: parentTable };
     setEmbeddedIn(next);
-    emitChange(next, collectionNames, cardinalityOverride);
+    emitChange(next, collectionNames);
     setSelected(parentTable);
   }
 
@@ -79,24 +149,18 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
     const next = { ...embeddedIn };
     delete next[childTable];
     setEmbeddedIn(next);
-    emitChange(next, collectionNames, cardinalityOverride);
+    emitChange(next, collectionNames);
     setSelected(childTable);
   }
 
   function renameCollection(tableName, newName) {
     const next = { ...collectionNames, [tableName]: newName };
     setCollectionNames(next);
-    emitChange(embeddedIn, next, cardinalityOverride);
+    emitChange(embeddedIn, next);
   }
 
-  function setCardinality(childTable, value) {
-    const next = { ...cardinalityOverride, [childTable]: value };
-    setCardinalityOverride(next);
-    emitChange(embeddedIn, collectionNames, next);
-  }
-
-  function emitChange(embedState, nameState, cardinalityState) {
-    onChange(buildLegacyMapping(schema, embedState, nameState, cardinalityState));
+  function emitChange(embedState, nameState) {
+    onChange(buildLegacyMapping(schema, embedState, nameState, referencesByRoot));
   }
 
   function handleDragStart(e, tableName) {
@@ -186,45 +250,24 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
               <span className="er-col-type">{c.dataType}</span>
             </div>
           ))}
-          {children.map((child) => {
-            const fk = child.foreignKeys.find((fk) => fk.refTable === table.name);
-            const isOverridden = child.name in cardinalityOverride;
-            const effectiveCardinality =
-              cardinalityOverride[child.name] ?? (fk && fk.unique ? "one" : "many");
-            return (
-              <div className="er-embedded-block" key={child.name}>
-                <div className="er-embedded-label">
-                  {child.name}{" "}
-                  <span className="pill-toggle" onClick={(e) => e.stopPropagation()}>
-                    <button
-                      className={effectiveCardinality === "one" ? "active" : ""}
-                      onClick={() => setCardinality(child.name, "one")}
-                    >
-                      one
-                    </button>
-                    <button
-                      className={effectiveCardinality === "many" ? "active" : ""}
-                      onClick={() => setCardinality(child.name, "many")}
-                    >
-                      many
-                    </button>
-                  </span>{" "}
-                  <span className="er-muted">{isOverridden ? "(manual)" : "(auto)"}</span>
-                  <button
-                    className="er-unembed-btn"
-                    title="Un-embed"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      unembed(child.name);
-                    }}
-                  >
-                    ✕
-                  </button>
-                </div>
-                {renderMongoCard(child, depth + 1)}
+          {children.map((child) => (
+            <div className="er-embedded-block" key={child.name}>
+              <div className="er-embedded-label">
+                {child.name} <span className="er-muted">[ ] embedded array</span>
+                <button
+                  className="er-unembed-btn"
+                  title="Un-embed"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    unembed(child.name);
+                  }}
+                >
+                  ✕
+                </button>
               </div>
-            );
-          })}
+              {renderMongoCard(child, depth + 1)}
+            </div>
+          ))}
         </div>
       </div>
     );
@@ -370,8 +413,10 @@ function inferInitialEmbeds(schema) {
 // Converts the visual embeddedIn/collectionNames state back into the
 // { collections: [{ collectionName, rootTable, primaryKey, embeds, references }] }
 // shape the Glue job generator expects, so nothing downstream has to change.
-function buildLegacyMapping(schema, embeddedIn, collectionNames, cardinalityOverride = {}) {
-  const tableByName = new Map(schema.tables.map((t) => [t.name, t]));
+// `referencesByRoot` (tableName -> reference entries, as returned by the
+// backend's /suggest-mapping) is passed through unchanged for any root the
+// user hasn't touched, instead of always emitting an empty references: [].
+function buildLegacyMapping(schema, embeddedIn, collectionNames, referencesByRoot = {}) {
   const topLevel = schema.tables.filter((t) => !embeddedIn[t.name]);
 
   const collections = topLevel.map((root) => {
@@ -383,19 +428,58 @@ function buildLegacyMapping(schema, embeddedIn, collectionNames, cardinalityOver
         foreignKey: fk ? fk.column : `${root.name}_id`,
         as: pluralize(child.name),
         // A single-column UNIQUE/PRIMARY KEY constraint on the FK column
-        // means at most one child row per parent (one-to-one) -- unless
-        // the user explicitly overrode it in the UI.
-        cardinality: cardinalityOverride[child.name] ?? (fk && fk.unique ? "one" : "many"),
+        // means at most one child row per parent (one-to-one).
+        cardinality: fk && fk.unique ? "one" : "many",
       };
     });
+    // Only keep a backend-suggested reference if the child table is still
+    // top-level (i.e. the user hasn't since dragged it into some embed) —
+    // otherwise it'd double up with the embeds list above.
+    const references = (referencesByRoot[root.name] || []).filter(
+      (ref) => !embeddedIn[ref.table]
+    );
     return {
       collectionName: collectionNames[root.name] || pluralize(root.name),
       rootTable: root.name,
       primaryKey: root.primaryKey,
       embeds,
-      references: [],
+      references,
     };
   });
 
   return { collections };
+}
+
+// Converts a backend /suggest-mapping response ({ collections: [{ rootTable,
+// collectionName, embeds, references }] }) into the { embeddedIn,
+// collectionNames, referencesByRoot } shape the canvas keeps as state.
+function fromSuggestedMapping(schema, suggestedMapping) {
+  const embeddedIn = {};
+  const collectionNames = {};
+  const referencesByRoot = {};
+  const knownTables = new Set(schema.tables.map((t) => t.name));
+
+  for (const collection of suggestedMapping.collections || []) {
+    if (!knownTables.has(collection.rootTable)) continue;
+    collectionNames[collection.rootTable] =
+      collection.collectionName || pluralize(collection.rootTable);
+    for (const embed of collection.embeds || []) {
+      if (!knownTables.has(embed.table)) continue;
+      embeddedIn[embed.table] = collection.rootTable;
+    }
+    if (collection.references && collection.references.length) {
+      referencesByRoot[collection.rootTable] = collection.references.filter((ref) =>
+        knownTables.has(ref.table)
+      );
+    }
+  }
+
+  // Any table the backend didn't mention at all (shouldn't normally happen,
+  // but keep the canvas usable if the response is incomplete) defaults to
+  // its own top-level collection.
+  for (const t of schema.tables) {
+    if (!(t.name in collectionNames)) collectionNames[t.name] = pluralize(t.name);
+  }
+
+  return { embeddedIn, collectionNames, referencesByRoot };
 }
