@@ -1,4 +1,5 @@
 import { useState } from "react";
+import ErDiagram from "./ErDiagram.jsx";
 
 // Keep in sync with backend/src/bsonTypeMapper.js's BSON_TYPES.
 const BSON_TYPES = ["string", "int", "long", "double", "decimal128", "bool", "date"];
@@ -10,6 +11,9 @@ export default function SchemaTree({
   onChangeColumnBsonType,
   onContinue,
 }) {
+  // "list" is the interactive editor (BSON types, synthetic FKs); "diagram"
+  // is a read-only visualization of the same schema.
+  const [viewMode, setViewMode] = useState("list");
   // Which table's "+ Add relationship" picker is open, and its form state.
   const [addRelationshipOpenFor, setAddRelationshipOpenFor] = useState(null);
   const [formState, setFormState] = useState({});
@@ -50,7 +54,22 @@ export default function SchemaTree({
         relationship the source database doesn't enforce as a real foreign key.
       </p>
 
-      {schema.tables.map((table) => (
+      <span className="pill-toggle" style={{ marginBottom: 14 }}>
+        <button className={viewMode === "list" ? "active" : ""} onClick={() => setViewMode("list")}>
+          List
+        </button>
+        <button
+          className={viewMode === "diagram" ? "active" : ""}
+          onClick={() => setViewMode("diagram")}
+        >
+          Diagram
+        </button>
+      </span>
+
+      {viewMode === "diagram" && <ErDiagram schema={schema} />}
+
+      {viewMode === "list" &&
+        schema.tables.map((table) => (
         <div key={table.name} className="table-chip" style={{ marginBottom: 14 }}>
           <strong>{table.name}</strong>{" "}
           <span style={{ color: "var(--muted)" }}>

@@ -59,10 +59,14 @@ mongo-relational-migrator/
 │       ├── api.js
 │       └── components/
 │           ├── ConnectionForm.jsx
-│           ├── SchemaTree.jsx
+│           ├── SchemaTree.jsx        (List / Diagram toggle -- see below)
+│           ├── ErDiagram.jsx         (read-only ER diagram, SVG-based)
+│           ├── ErTableCard.jsx       (single-table card, shared by ErDiagram)
 │           ├── MappingCanvas.jsx     (drag-and-drop embed/reference editor)
 │           ├── GlueJobPreview.jsx
 │           └── TestLoadPanel.jsx
+│       └── lib/
+│           └── erDiagramLayout.js   (pure tiered-layout logic for ErDiagram)
 └── scripts/             Local (no-AWS) Glue job test harness
     ├── test-local-glue.sh
     └── make_local_test_variant.py
@@ -188,6 +192,34 @@ a MongoDB type without a human deciding.
   `read_table(...)` call — including a `date` → Spark `timestamp` (not
   `date`) mapping, since BSON's `Date` is a full instant and Spark's
   `DateType` would otherwise silently drop the time component.
+
+## ER diagram
+
+The Schema step has a **List / Diagram** toggle. List is the interactive
+editor described above (BSON types, synthetic FKs) and stays the default;
+Diagram is a read-only visualization of the same schema, built from scratch
+with plain SVG (no graph/diagram library — this project has none, and none
+was added for this).
+
+- Tables are laid out in tiers by a simple topological pass over the
+  foreign-key graph (`frontend/src/lib/erDiagramLayout.js`): tables with no
+  outgoing FK sit in tier 0, each subsequent tier holds tables whose FKs all
+  point into earlier tiers, and any leftover tables (a genuine multi-table FK
+  cycle) get dumped into one final tier so layout always terminates. Tables
+  within a tier are then reordered by the average position of their FK
+  targets in the tier above, to reduce line crossings.
+- Connector lines are cubic Beziers spread across each card's edge width (so
+  several edges into/out of the same table don't all overlap at one point),
+  drawn **dashed** for synthetic FKs and solid for real ones — mirroring the
+  `[synthetic]` badge already used in List view. Self-referencing FKs (a
+  table pointing at itself) render as a small loop instead of a line.
+- Card positions are measured from the actual rendered DOM
+  (`getBoundingClientRect`-equivalent via `offsetLeft`/`offsetTop`) rather
+  than computed from a height formula, since card height varies with column
+  count — this keeps the diagram correct without having to hand-derive
+  sizing constants that would drift out of sync with `styles.css`.
+- No pan/zoom — the diagram container just scrolls. Fine for the tens of
+  tables this is meant for; not designed for hundreds.
 
 ## Using the generated Glue job
 
