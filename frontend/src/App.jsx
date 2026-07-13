@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "./api";
 import ConnectionForm from "./components/ConnectionForm.jsx";
 import SchemaTree from "./components/SchemaTree.jsx";
@@ -19,6 +19,10 @@ export default function App() {
   const [dbType, setDbType] = useState("postgres");
   const [connection, setConnection] = useState(null);
   const [schema, setSchema] = useState(null);
+  // Which introspected tables actually carry into Mapping/the Glue job --
+  // defaults to "everything" the moment a schema is set, so behavior is
+  // unchanged unless the user deliberately deselects something.
+  const [selectedTableNames, setSelectedTableNames] = useState(new Set());
   const [mapping, setMapping] = useState(null);
   const [script, setScript] = useState("");
   const [loading, setLoading] = useState(false);
@@ -37,6 +41,7 @@ export default function App() {
       // the user already added to the previous `schema` -- worth a confirm
       // dialog before overwriting once that becomes a common workflow.
       setSchema(result);
+      setSelectedTableNames(new Set(result.tables.map((t) => t.name)));
       setStep("schema");
     } catch (err) {
       setError(err.message);
@@ -83,11 +88,45 @@ export default function App() {
     }));
   }
 
+  function toggleTableSelection(tableName) {
+    setSelectedTableNames((prev) => {
+      const next = new Set(prev);
+      if (next.has(tableName)) next.delete(tableName);
+      else next.add(tableName);
+      return next;
+    });
+  }
+
+  function selectAllTables() {
+    setSelectedTableNames(new Set(schema.tables.map((t) => t.name)));
+  }
+
+  function deselectAllTables() {
+    setSelectedTableNames(new Set());
+  }
+
+  // The schema actually passed to Mapping/the Glue job -- only selected
+  // tables, with each kept table's foreignKeys filtered to drop any FK
+  // pointing at a table that isn't also selected (avoids dangling
+  // references reaching MappingCanvas/glueJobGenerator.js, neither of
+  // which guards against a refTable that doesn't exist in the array).
+  const workingSchema = useMemo(() => {
+    if (!schema) return null;
+    return {
+      tables: schema.tables
+        .filter((t) => selectedTableNames.has(t.name))
+        .map((t) => ({
+          ...t,
+          foreignKeys: t.foreignKeys.filter((fk) => selectedTableNames.has(fk.refTable)),
+        })),
+    };
+  }, [schema, selectedTableNames]);
+
   async function handleGenerateGlueJob({ jdbc, mongo }) {
     setError(null);
     setLoading(true);
     try {
-      const result = await api.generateGlueJob({ jdbc, mongo, schema, mapping });
+      const result = await api.generateGlueJob({ jdbc, mongo, schema: workingSchema, mapping });
       setScript(result.script);
     } catch (err) {
       setError(err.message);
@@ -140,6 +179,11 @@ export default function App() {
       {step === "schema" && (
         <SchemaTree
           schema={schema}
+          workingSchema={workingSchema}
+          selectedTableNames={selectedTableNames}
+          onToggleTable={toggleTableSelection}
+          onSelectAllTables={selectAllTables}
+          onDeselectAllTables={deselectAllTables}
           onAddForeignKey={addSyntheticForeignKey}
           onRemoveForeignKey={removeSyntheticForeignKey}
           onChangeColumnBsonType={setColumnBsonType}
@@ -149,7 +193,7 @@ export default function App() {
 
       {step === "mapping" && (
         <MappingCanvas
-          schema={schema}
+          schema={workingSchema}
           onChange={setMapping}
           onContinue={() => setStep("glue")}
         />

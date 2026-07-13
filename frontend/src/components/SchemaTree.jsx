@@ -6,6 +6,11 @@ const BSON_TYPES = ["string", "int", "long", "double", "decimal128", "bool", "da
 
 export default function SchemaTree({
   schema,
+  workingSchema,
+  selectedTableNames,
+  onToggleTable,
+  onSelectAllTables,
+  onDeselectAllTables,
   onAddForeignKey,
   onRemoveForeignKey,
   onChangeColumnBsonType,
@@ -20,9 +25,13 @@ export default function SchemaTree({
 
   if (!schema) return null;
 
+  // Only selected tables are valid relationship targets -- anything else
+  // would just be silently dropped from workingSchema anyway.
+  const selectableTables = schema.tables.filter((t) => selectedTableNames.has(t.name));
+
   function openAddRelationship(tableName) {
     const table = schema.tables.find((t) => t.name === tableName);
-    const defaultRefTable = schema.tables.find((t) => t.name !== tableName) || table;
+    const defaultRefTable = selectableTables.find((t) => t.name !== tableName) || table;
     setFormState({
       column: table.columns[0]?.name || "",
       refTable: defaultRefTable.name,
@@ -54,6 +63,35 @@ export default function SchemaTree({
         relationship the source database doesn't enforce as a real foreign key.
       </p>
 
+      <div className="er-table-selector">
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span className="hint" style={{ margin: 0 }}>
+            {selectedTableNames.size} of {schema.tables.length} tables selected for
+            Mapping/the Glue job
+          </span>
+          <span>
+            <button className="btn secondary" style={{ padding: "4px 10px", fontSize: 12 }} onClick={onSelectAllTables}>
+              Select all
+            </button>{" "}
+            <button className="btn secondary" style={{ padding: "4px 10px", fontSize: 12 }} onClick={onDeselectAllTables}>
+              Deselect all
+            </button>
+          </span>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+          {schema.tables.map((t) => (
+            <label key={t.name} className="er-table-chip">
+              <input
+                type="checkbox"
+                checked={selectedTableNames.has(t.name)}
+                onChange={() => onToggleTable(t.name)}
+              />
+              {t.name}
+            </label>
+          ))}
+        </div>
+      </div>
+
       <span className="pill-toggle" style={{ marginBottom: 14 }}>
         <button className={viewMode === "list" ? "active" : ""} onClick={() => setViewMode("list")}>
           List
@@ -68,14 +106,16 @@ export default function SchemaTree({
 
       {viewMode === "diagram" && (
         <ErDiagram
-          schema={schema}
+          schema={workingSchema}
           onAddForeignKey={onAddForeignKey}
           onRemoveForeignKey={onRemoveForeignKey}
         />
       )}
 
       {viewMode === "list" &&
-        schema.tables.map((table) => (
+        schema.tables
+          .filter((table) => selectedTableNames.has(table.name))
+          .map((table) => (
         <div key={table.name} className="table-chip" style={{ marginBottom: 14 }}>
           <strong>{table.name}</strong>{" "}
           <span style={{ color: "var(--muted)" }}>
@@ -188,7 +228,7 @@ export default function SchemaTree({
                       }));
                     }}
                   >
-                    {schema.tables.map((t) => (
+                    {selectableTables.map((t) => (
                       <option key={t.name} value={t.name}>
                         {t.name}
                       </option>
@@ -201,7 +241,7 @@ export default function SchemaTree({
                     value={formState.refColumn}
                     onChange={(e) => setFormState((f) => ({ ...f, refColumn: e.target.value }))}
                   >
-                    {(schema.tables.find((t) => t.name === formState.refTable)?.columns || []).map(
+                    {(selectableTables.find((t) => t.name === formState.refTable)?.columns || []).map(
                       (c) => (
                         <option key={c.name} value={c.name}>
                           {c.name}

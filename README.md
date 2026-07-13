@@ -309,6 +309,36 @@ What it does:
    your machine (e.g. the disposable Postgres/Mongo containers above).
 4. Leaves the full Spark log at `.local-test/spark_run.log`.
 
+## Roadmap
+
+Five larger items, in rough build order (smallest/most contained first):
+
+1. ~~**Table selection**~~ — **done.** Pick which tables (of possibly 100+)
+   actually carry into the Mapping step and generated job via checkboxes at
+   the top of the Schema step ("Select all"/"Deselect all" included),
+   instead of every introspected table being forced in. Introspection
+   itself still reads everything (cheap metadata); the selection is a
+   client-side filter (`workingSchema` in `App.jsx`) applied before the
+   schema reaches Mapping or `/api/generate-glue-job`.
+2. **Full vs. incremental load** — an incremental write strategy (e.g.
+   upsert by primary key, or a watermark/last-modified column) alongside
+   today's full-overwrite-only `mode("overwrite")`. Touches
+   `glueJobGenerator.js` and the Glue-job step's UI.
+3. **Additional relational sources** — beyond Postgres/MySQL (e.g. SQL
+   Server, Oracle). Each new engine needs its own `information_schema`-
+   equivalent introspection queries and JDBC driver wired into the
+   generated script.
+4. **Computed/derived columns** — let a user define a column that doesn't
+   exist in the source (concatenating two columns, defaulting to
+   `CURRENT_DATE`, simple expressions), not just pass-through source
+   columns. Needs a small expression model added to the schema shape plus
+   codegen support in `glueJobGenerator.js`.
+5. **Direct cloud deployment** — actually create/run the Glue job (or an
+   EMR/Dataproc equivalent) via AWS/GCP SDKs from this tool, instead of
+   only generating a downloadable script. The largest of the five — real
+   cloud credentials, IAM/service-account wiring, and per-provider
+   deployment logic.
+
 ## Known gaps
 
 - Glue-only — no EMR/Dataproc generator yet
