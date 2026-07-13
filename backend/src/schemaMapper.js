@@ -60,7 +60,7 @@ function suggestMapping(schema) {
 
       const entry = {
         table: t.name,
-        foreignKey: fksToRoot[0].column,
+        foreignKey: fksToRoot[0].columns,
         as: pluralize(t.name),
         // Inferred from a single-column UNIQUE/PRIMARY KEY constraint on the
         // FK column: if present, at most one child row exists per parent

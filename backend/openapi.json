@@ -72,9 +72,9 @@
                 "schema": {
                   "tables": [
                     { "name": "customers", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }], "primaryKey": ["id"], "foreignKeys": [] },
-                    { "name": "customer_profiles", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "column": "customer_id", "refTable": "customers", "refColumn": "id", "unique": true }] },
-                    { "name": "addresses", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "column": "customer_id", "refTable": "customers", "refColumn": "id", "unique": false }] },
-                    { "name": "orders", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "column": "customer_id", "refTable": "customers", "refColumn": "id", "unique": false }] }
+                    { "name": "customer_profiles", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "columns": ["customer_id"], "refTable": "customers", "refColumns": ["id"], "unique": true }] },
+                    { "name": "addresses", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "columns": ["customer_id"], "refTable": "customers", "refColumns": ["id"], "unique": false }] },
+                    { "name": "orders", "columns": [{ "name": "id", "dataType": "integer", "nullable": false, "isPrimaryKey": true }, { "name": "customer_id", "dataType": "integer", "nullable": true, "isPrimaryKey": false }], "primaryKey": ["id"], "foreignKeys": [{ "columns": ["customer_id"], "refTable": "customers", "refColumns": ["id"], "unique": false }] }
                   ]
                 }
               }
@@ -237,10 +237,10 @@
       "ForeignKey": {
         "type": "object",
         "properties": {
-          "column": { "type": "string" },
+          "columns": { "type": "array", "items": { "type": "string" }, "description": "Always an array, in corresponding order with refColumns -- length 1 for an ordinary FK, length N for a composite (multi-column) one" },
           "refTable": { "type": "string" },
-          "refColumn": { "type": "string" },
-          "unique": { "type": "boolean", "description": "True when this column has a single-column UNIQUE/PRIMARY KEY constraint -- drives the one/many cardinality inference" },
+          "refColumns": { "type": "array", "items": { "type": "string" } },
+          "unique": { "type": "boolean", "description": "True when this FK's exact column set (as a set, any order) is covered by a UNIQUE/PRIMARY KEY constraint on this table -- drives the one/many cardinality inference" },
           "synthetic": { "type": "boolean", "description": "True when this FK was manually declared by the user in the Schema step rather than detected from a real database constraint" }
         }
       },
@@ -261,7 +261,7 @@
         "type": "object",
         "properties": {
           "table": { "type": "string" },
-          "foreignKey": { "type": "string" },
+          "foreignKey": { "type": "array", "items": { "type": "string" }, "description": "Always an array -- length 1 for an ordinary FK, length N for a composite one" },
           "as": { "type": "string" },
           "cardinality": { "type": "string", "enum": ["one", "many"] },
           "strategy": { "type": "string", "enum": ["reference"], "description": "Present only on entries in \"references\"" }

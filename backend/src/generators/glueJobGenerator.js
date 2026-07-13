@@ -272,12 +272,17 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
 
   // Embeds: read child table, group by FK, collect_list(struct(...)) the
   // non-key columns, then left-join that nested array back onto the root.
+  // embed.foreignKey is always an array (length 1 for an ordinary FK,
+  // length N for a composite one) -- join keys are aliased positionally
+  // (_join_key_0, _join_key_1, ...) and the root join ANDs every position,
+  // pairing collection.primaryKey[i] with _join_key_i.
   for (const embed of collection.embeds) {
     const childTable = tableByName.get(embed.table);
     if (!childTable) continue;
 
     const childVar = toVar(embed.table);
     const nestedVar = `${childVar}_nested`;
+    const fkCols = embed.foreignKey;
     const childPk = childTable.primaryKey && childTable.primaryKey[0];
     // Primary key first, everything else keeping its original relative
     // order -- lets plain array_sort(...) (single-argument; Spark 3.3/Glue
@@ -285,12 +290,17 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
     // Spark 3.4) sort structs by their first field and get "sorted by PK"
     // for free, with no comparator needed.
     const nonKeyCols = childTable.columns
-      .filter((c) => c.name !== embed.foreignKey)
+      .filter((c) => !fkCols.includes(c.name))
       .map((c) => c.name)
       .sort((a, b) => (a === childPk ? -1 : b === childPk ? 1 : 0));
 
     const structFields = nonKeyCols
       .map((c) => `col(${pythonStr(c)}).alias(${pythonStr(c)})`)
+      .join(", ");
+
+    const joinKeyAliases = fkCols.map((_, i) => `_join_key_${i}`);
+    const joinKeySelectExprs = fkCols
+      .map((c, i) => `col(${pythonStr(c)}).alias(${pythonStr(joinKeyAliases[i])})`)
       .join(", ");
 
     lines.push("");
@@ -301,7 +311,7 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
     if (embed.cardinality === "one") {
       // 1:1 or 1:few-but-flattened -> embed as a single nested object per row.
       lines.push(
-        `${nestedVar} = ${childVar}.select(col(${pythonStr(embed.foreignKey)}).alias("_join_key"), struct(${structFields}).alias(${pythonStr(embed.as)}))`
+        `${nestedVar} = ${childVar}.select(${joinKeySelectExprs}, struct(${structFields}).alias(${pythonStr(embed.as)}))`
       );
     } else {
       // 1:many -> embed as an array of nested objects per row. In SCD2 mode,
@@ -318,13 +328,20 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
           ? `array_sort(${collectExpr})`
           : collectExpr;
       lines.push(
-        `${nestedVar} = ${childVar}.groupBy(col(${pythonStr(embed.foreignKey)}).alias("_join_key")).agg(${orderedCollectExpr}.alias(${pythonStr(embed.as)}))`
+        `${nestedVar} = ${childVar}.groupBy(${joinKeySelectExprs}).agg(${orderedCollectExpr}.alias(${pythonStr(embed.as)}))`
       );
     }
 
     const joinedVar = `${currentVar}_with_${childVar}`;
+    const rootKeys = rootKeyCols(collection);
+    const pairCount = Math.min(rootKeys.length, fkCols.length);
+    const joinCond = Array.from(
+      { length: pairCount },
+      (_, i) => `(${currentVar}[${pythonStr(rootKeys[i])}] == ${nestedVar}[${pythonStr(joinKeyAliases[i])}])`
+    ).join(" & ");
+    const dropArgs = joinKeyAliases.map((a) => pythonStr(a)).join(", ");
     lines.push(
-      `${joinedVar} = ${currentVar}.join(${nestedVar}, ${currentVar}[${pythonStr(rootKeyOf(collection))}] == ${nestedVar}["_join_key"], "left").drop("_join_key")`
+      `${joinedVar} = ${currentVar}.join(${nestedVar}, ${joinCond}, "left").drop(${dropArgs})`
     );
     currentVar = joinedVar;
   }
@@ -342,7 +359,7 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
 
     const refVar = toVar(ref.table);
     lines.push("");
-    lines.push(`# Reference "${ref.table}" -> kept as its own collection, linked by "${ref.foreignKey}"`);
+    lines.push(`# Reference "${ref.table}" -> kept as its own collection, linked by "${ref.foreignKey.join(", ")}"`);
     lines.push(`${refVar} = read_table(${pythonStr(ref.table)})`);
     lines.push(castSelectLines(refVar, refTable));
     lines.push(
@@ -353,10 +370,8 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
   return lines.join("\n");
 }
 
-function rootKeyOf(collection) {
-  return collection.primaryKey && collection.primaryKey.length
-    ? collection.primaryKey[0]
-    : "id";
+function rootKeyCols(collection) {
+  return collection.primaryKey && collection.primaryKey.length ? collection.primaryKey : ["id"];
 }
 
 // Comma-joined primary key column(s) for the MongoDB Spark Connector's

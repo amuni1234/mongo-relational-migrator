@@ -152,10 +152,13 @@ export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey 
   }, [dragStart]);
 
   function confirmConnection() {
+    // Drag-and-drop creation is always single-column (see erDiagramLayout.js
+    // for why composite relationships are List-view-only) -- still needs
+    // to be wrapped in arrays to match the data model.
     onAddForeignKey(pendingConnection.fromTable, {
-      column: pendingConnection.fromColumn,
+      columns: [pendingConnection.fromColumn],
       refTable: pendingConnection.toTable,
-      refColumn: pendingConnection.toColumn,
+      refColumns: [pendingConnection.toColumn],
       unique: pendingConnection.unique,
     });
     setPendingConnection(null);
@@ -205,8 +208,12 @@ export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey 
           </defs>
 
           {edges.map((edge, i) => {
-            const fromRow = rowPositions[`${edge.from}::${edge.column}`];
-            const toRow = rowPositions[`${edge.to}::${edge.refColumn}`];
+            // Anchor at the first column pair -- for a composite (multi-
+            // column) relationship, drawing N parallel lines would clutter
+            // the diagram for little benefit; the label still lists every
+            // column so the full relationship is legible.
+            const fromRow = rowPositions[`${edge.from}::${edge.columns[0]}`];
+            const toRow = rowPositions[`${edge.to}::${edge.refColumns[0]}`];
             const fromCard = positions[edge.from];
             const toCard = positions[edge.to];
             if (!fromRow || !toRow || !fromCard || !toCard) return null;
@@ -234,7 +241,7 @@ export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey 
                   />
                 )}
                 <text x={midX} y={midY} className="er-fk-label">
-                  {edge.column}
+                  {edge.columns.join(", ")}
                 </text>
                 {edge.synthetic && hoveredEdgeIndex === i && (
                   <g
@@ -254,8 +261,8 @@ export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey 
 
           {selfEdges.map((edge, i) => {
             const cardPos = positions[edge.from];
-            const fromRow = rowPositions[`${edge.from}::${edge.column}`];
-            const toRow = rowPositions[`${edge.from}::${edge.refColumn}`];
+            const fromRow = rowPositions[`${edge.from}::${edge.columns[0]}`];
+            const toRow = rowPositions[`${edge.from}::${edge.refColumns[0]}`];
             if (!cardPos || !fromRow || !toRow) return null;
 
             const fromAnchor = { x: cardPos.x + cardPos.width, y: fromRow.y + fromRow.height / 2 };
@@ -281,7 +288,7 @@ export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey 
                   />
                 )}
                 <text x={fromAnchor.x + bulge / 2} y={(fromAnchor.y + toAnchor.y) / 2} className="er-fk-label">
-                  {edge.column}
+                  {edge.columns.join(", ")}
                 </text>
                 {edge.synthetic && hoveredEdgeIndex === `self-${i}` && (
                   <g

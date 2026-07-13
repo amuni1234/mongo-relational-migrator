@@ -132,6 +132,19 @@ Connect to it in the wizard with host `localhost`, port `5433`, database
 `orders` don't (one-to-many) — this is what lets you see both cardinality
 branches in the generated script.
 
+Optionally, add a composite (multi-column) key pair too, to exercise that
+support specifically:
+```sql
+CREATE TABLE order_items (order_id int NOT NULL, line_no int NOT NULL, product_name text, quantity int, PRIMARY KEY (order_id, line_no));
+CREATE TABLE shipments (order_id int NOT NULL, line_no int NOT NULL, shipped_at timestamp, CONSTRAINT fk_shipment_item FOREIGN KEY (order_id, line_no) REFERENCES order_items(order_id, line_no));
+
+INSERT INTO order_items (order_id, line_no, product_name, quantity) VALUES (1, 1, 'Widget', 5), (1, 2, 'Gadget', 3), (2, 1, 'Gizmo', 1);
+INSERT INTO shipments (order_id, line_no, shipped_at) VALUES (1, 1, '2026-01-01 10:00:00'), (1, 2, '2026-01-02 11:00:00'), (2, 1, '2026-01-03 12:00:00');
+```
+Order 1's two line items share the same `order_id` but have different
+`line_no`s and distinct shipments — a good check that the embed join is
+matching on the *full* composite key, not just `order_id`.
+
 For a Mongo target, either run one locally:
 ```bash
 docker run --rm -d --name migrator-test-mongo -p 27017:27017 mongo:7
@@ -192,6 +205,44 @@ a MongoDB type without a human deciding.
   `read_table(...)` call — including a `date` → Spark `timestamp` (not
   `date`) mapping, since BSON's `Date` is a full instant and Spark's
   `DateType` would otherwise silently drop the time component.
+
+## Composite (multi-column) key support
+
+Every foreign key — real or synthetic — is represented as `{ columns: [...],
+refTable, refColumns: [...] }`, always arrays, in corresponding order
+(`columns[i]` on the child maps to `refColumns[i]` on the parent). Length 1
+for an ordinary single-column FK; length N for a composite one.
+
+- **Introspection.** Postgres FK detection uses `pg_constraint`'s
+  `conkey`/`confkey` arrays (`unnest(...) WITH ORDINALITY`, joined on
+  matching ordinal position) rather than the `information_schema`
+  3-way join — the latter produces a **cartesian product** for a
+  composite FK (a 2-column FK constraint yields 2×2=4 rows instead of 2
+  correctly-paired ones, since nothing correlates which source column
+  pairs with which referenced column). Confirmed empirically before fixing
+  it: a real 2-column FK on a test table produced exactly this 4-row
+  mismatch under the old query. MySQL's `key_column_usage` doesn't have
+  this problem — it already pairs columns correctly per row.
+- **Uniqueness / cardinality** for a composite FK is checked against the
+  FK's *entire* column set (as a set, any order) matching some
+  UNIQUE/PRIMARY KEY constraint on the child table — not any single column
+  in isolation.
+- **Embed joins** in the generated Glue script AND every column-pair
+  position together (`(root[pk0] == child[fk0]) & (root[pk1] ==
+  child[fk1])`, and so on) — fixed after finding that the join previously
+  only used the *first* column of a composite root primary key, which
+  would silently attach child rows to the wrong parent whenever two
+  parent rows shared the same first-key-column value. Verified with a
+  concrete case (two `order_items` rows sharing the same `order_id` but
+  different `line_no`, each with its own distinct `shipments` row) — each
+  line item correctly got only its own shipment, not both.
+- **Authoring**: the Schema step's "+ Add relationship" form supports
+  building up a composite relationship one column-pair at a time ("+ Add
+  column pair"). The **ER diagram's drag-and-drop stays single-column
+  only** for *creating* a new relationship — it still correctly *displays*
+  an existing composite relationship as one edge (anchored at the first
+  column pair, labeled with every column name), it just can't build a
+  multi-column one via drag-and-drop.
 
 ## ER diagram
 

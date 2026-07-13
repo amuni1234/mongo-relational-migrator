@@ -13,13 +13,18 @@
  *       // the "string" fallback was used.
  *       columns: [{ name, dataType, nullable, isPrimaryKey, bsonType, bsonTypeConfident }],
  *       primaryKey: ["id"],
- *       // `unique` is true when `column` is covered by a single-column
- *       // UNIQUE or PRIMARY KEY constraint on this table, i.e. the FK
- *       // relationship is one-to-one/one-to-zero rather than one-to-many.
+ *       // `columns`/`refColumns` are always arrays, in corresponding order
+ *       // (columns[i] on this table maps to refColumns[i] on refTable) --
+ *       // length 1 for an ordinary single-column FK, length N for a
+ *       // composite (multi-column) FK.
+ *       // `unique` is true when this FK's exact column set (as a set, any
+ *       // order) is covered by a UNIQUE or PRIMARY KEY constraint on this
+ *       // table, i.e. the relationship is one-to-one/one-to-zero rather
+ *       // than one-to-many.
  *       // `synthetic` (added by the UI, never set by introspect() itself)
  *       // marks a relationship the user manually declared because no real
  *       // FK constraint exists in the source database for it.
- *       foreignKeys: [{ column, refTable, refColumn, unique, synthetic }]
+ *       foreignKeys: [{ columns, refTable, refColumns, unique, synthetic }]
  *     },
  *     ...
  *   ]
@@ -60,21 +65,29 @@ async function introspectPostgres(connectionConfig) {
       ORDER BY c.table_name, c.ordinal_position;
     `);
 
+    // information_schema's table_constraints/key_column_usage/
+    // constraint_column_usage 3-way join (joined only on constraint_name)
+    // produces a CARTESIAN PRODUCT for a composite FK -- nothing correlates
+    // *which* source column pairs with *which* referenced column, so a
+    // 2-column FK yields 2x2=4 rows instead of 2 correctly-paired ones
+    // (confirmed empirically). pg_constraint's conkey/confkey arrays,
+    // unnested WITH ORDINALITY and joined on matching ordinal position, is
+    // the reliable way to extract correctly-paired composite FK columns.
     const fkRes = await client.query(`
       SELECT
-        tc.table_name   AS table_name,
-        kcu.column_name AS column_name,
-        ccu.table_name  AS ref_table,
-        ccu.column_name AS ref_column
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-       AND tc.table_schema = kcu.table_schema
-      JOIN information_schema.constraint_column_usage ccu
-        ON tc.constraint_name = ccu.constraint_name
-       AND tc.table_schema = ccu.table_schema
-      WHERE tc.constraint_type = 'FOREIGN KEY'
-        AND tc.table_schema = 'public';
+        con.conrelid::regclass::text AS table_name,
+        att2.attname AS column_name,
+        con.confrelid::regclass::text AS ref_table,
+        att1.attname AS ref_column,
+        con.conname AS constraint_name,
+        ak.ord AS ordinal
+      FROM pg_constraint con
+      JOIN unnest(con.conkey) WITH ORDINALITY AS ak(attnum, ord) ON true
+      JOIN unnest(con.confkey) WITH ORDINALITY AS confk(attnum, ord) ON ak.ord = confk.ord
+      JOIN pg_attribute att2 ON att2.attrelid = con.conrelid AND att2.attnum = ak.attnum
+      JOIN pg_attribute att1 ON att1.attrelid = con.confrelid AND att1.attnum = confk.attnum
+      WHERE con.contype = 'f'
+        AND con.connamespace = 'public'::regnamespace;
     `);
 
     const uniqueRes = await client.query(`
@@ -99,8 +112,10 @@ async function introspectPostgres(connectionConfig) {
       fkColumn: "column_name",
       fkRefTable: "ref_table",
       fkRefColumn: "ref_column",
+      fkConstraint: "constraint_name",
+      fkOrdinal: "ordinal",
       nullableTrueValue: "YES",
-    }, buildSingleColumnUniqueSets(uniqueRes.rows, {
+    }, buildUniqueColumnSets(uniqueRes.rows, {
       table: "table_name",
       constraint: "constraint_name",
       column: "column_name",
@@ -129,13 +144,19 @@ async function introspectMysql(connectionConfig) {
       [connectionConfig.database]
     );
 
+    // MySQL's key_column_usage already correctly pairs column_name with
+    // referenced_column_name per row (no cartesian-product risk here,
+    // unlike Postgres's information_schema) -- just need the constraint
+    // name + ordinal position too, to group/order composite FKs correctly.
     const [fks] = await conn.execute(
       `
       SELECT
-        TABLE_NAME            AS table_name,
-        COLUMN_NAME           AS column_name,
-        REFERENCED_TABLE_NAME AS ref_table,
-        REFERENCED_COLUMN_NAME AS ref_column
+        TABLE_NAME             AS table_name,
+        COLUMN_NAME            AS column_name,
+        REFERENCED_TABLE_NAME  AS ref_table,
+        REFERENCED_COLUMN_NAME AS ref_column,
+        CONSTRAINT_NAME        AS constraint_name,
+        ORDINAL_POSITION       AS ordinal
       FROM information_schema.key_column_usage
       WHERE table_schema = ?
         AND referenced_table_name IS NOT NULL;
@@ -173,8 +194,10 @@ async function introspectMysql(connectionConfig) {
       fkColumn: "column_name",
       fkRefTable: "ref_table",
       fkRefColumn: "ref_column",
+      fkConstraint: "constraint_name",
+      fkOrdinal: "ordinal",
       nullableTrueValue: "YES",
-    }, buildSingleColumnUniqueSets(uniqueRows, {
+    }, buildUniqueColumnSets(uniqueRows, {
       table: "table_name",
       constraint: "constraint_name",
       column: "column_name",
@@ -184,13 +207,13 @@ async function introspectMysql(connectionConfig) {
   }
 }
 
-// Groups constraint rows by (table, constraint) to find constraints that
-// cover exactly one column — those are the ones that make a FK column
-// unique (and so the relationship one-to-one rather than one-to-many).
-// Multi-column constraints don't make any single column in them unique on
-// its own, so they're intentionally excluded.
-function buildSingleColumnUniqueSets(rows, keys) {
-  const constraints = new Map();
+// Groups constraint rows by (table, constraint) into one column-set per
+// constraint, regardless of size -- a composite unique/PK constraint's
+// column set is tracked in full (not discarded the way single-column-only
+// tracking would), since a composite FK's uniqueness has to be checked
+// against the FK's *entire* column set, not any one column in isolation.
+function buildUniqueColumnSets(rows, keys) {
+  const constraints = new Map(); // constraintName -> { table, columns: Set }
   for (const row of rows) {
     const constraintName = row[keys.constraint];
     if (!constraints.has(constraintName)) {
@@ -199,18 +222,56 @@ function buildSingleColumnUniqueSets(rows, keys) {
     constraints.get(constraintName).columns.add(row[keys.column]);
   }
 
-  const uniqueSingleColumnsByTable = new Map();
+  const uniqueColumnSetsByTable = new Map(); // tableName -> Set<string>[] (one Set per constraint)
   for (const { table: tableName, columns } of constraints.values()) {
-    if (columns.size !== 1) continue;
-    if (!uniqueSingleColumnsByTable.has(tableName)) {
-      uniqueSingleColumnsByTable.set(tableName, new Set());
-    }
-    uniqueSingleColumnsByTable.get(tableName).add([...columns][0]);
+    if (!uniqueColumnSetsByTable.has(tableName)) uniqueColumnSetsByTable.set(tableName, []);
+    uniqueColumnSetsByTable.get(tableName).push(columns);
   }
-  return uniqueSingleColumnsByTable;
+  return uniqueColumnSetsByTable;
 }
 
-function buildSchema(columnRows, fkRows, keys, uniqueSingleColumnsByTable = new Map()) {
+// Does `columns` (as a set, any order) exactly match one of this table's
+// unique/PK constraint column sets?
+function isColumnSetUnique(uniqueColumnSetsByTable, tableName, columns) {
+  const sets = uniqueColumnSetsByTable.get(tableName);
+  if (!sets) return false;
+  const target = new Set(columns);
+  return sets.some((set) => set.size === target.size && [...set].every((c) => target.has(c)));
+}
+
+// Groups FK rows by constraint name into one entry per constraint (instead
+// of one entry per column), ordered by ordinal position so columns[i] on
+// this table always corresponds to refColumns[i] on refTable.
+function buildForeignKeyGroups(fkRows, keys) {
+  const constraints = new Map(); // constraintName -> { table, refTable, pairs: [{column, refColumn, ordinal}] }
+  for (const row of fkRows) {
+    const name = row[keys.fkConstraint];
+    if (!constraints.has(name)) {
+      constraints.set(name, {
+        table: row[keys.table],
+        refTable: row[keys.fkRefTable],
+        pairs: [],
+      });
+    }
+    constraints.get(name).pairs.push({
+      column: row[keys.fkColumn],
+      refColumn: row[keys.fkRefColumn],
+      ordinal: row[keys.fkOrdinal],
+    });
+  }
+
+  return Array.from(constraints.values()).map(({ table, refTable, pairs }) => {
+    const ordered = [...pairs].sort((a, b) => a.ordinal - b.ordinal);
+    return {
+      table,
+      refTable,
+      columns: ordered.map((p) => p.column),
+      refColumns: ordered.map((p) => p.refColumn),
+    };
+  });
+}
+
+function buildSchema(columnRows, fkRows, keys, uniqueColumnSetsByTable = new Map()) {
   const tableMap = new Map();
 
   for (const row of columnRows) {
@@ -240,16 +301,14 @@ function buildSchema(columnRows, fkRows, keys, uniqueSingleColumnsByTable = new 
     if (isPk) table.primaryKey.push(row[keys.column]);
   }
 
-  for (const row of fkRows) {
-    const table = tableMap.get(row[keys.table]);
+  for (const group of buildForeignKeyGroups(fkRows, keys)) {
+    const table = tableMap.get(group.table);
     if (!table) continue;
-    const fkColumn = row[keys.fkColumn];
-    const uniqueColumns = uniqueSingleColumnsByTable.get(row[keys.table]);
     table.foreignKeys.push({
-      column: fkColumn,
-      refTable: row[keys.fkRefTable],
-      refColumn: row[keys.fkRefColumn],
-      unique: Boolean(uniqueColumns && uniqueColumns.has(fkColumn)),
+      columns: group.columns,
+      refTable: group.refTable,
+      refColumns: group.refColumns,
+      unique: isColumnSetUnique(uniqueColumnSetsByTable, group.table, group.columns),
     });
   }
 

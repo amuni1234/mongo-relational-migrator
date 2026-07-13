@@ -16,8 +16,13 @@ function buildEdges(tables) {
       const edge = {
         from: table.name,
         to: fk.refTable,
-        column: fk.column,
-        refColumn: fk.refColumn,
+        // Arrays -- length 1 for an ordinary FK, length N for a composite
+        // one. The diagram only ever anchors/draws using the first pair
+        // (columns[0]/refColumns[0]) -- see ErDiagram.jsx -- but the label
+        // shows every column name so a composite relationship is still
+        // fully legible.
+        columns: fk.columns,
+        refColumns: fk.refColumns,
         synthetic: !!fk.synthetic,
         // Index within table.foreignKeys -- lets deletion call
         // onRemoveForeignKey(edge.from, edge.fkIndex) directly, matching

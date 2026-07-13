@@ -380,7 +380,7 @@ function buildLegacyMapping(schema, embeddedIn, collectionNames, cardinalityOver
       const fk = child.foreignKeys.find((fk) => fk.refTable === root.name);
       return {
         table: child.name,
-        foreignKey: fk ? fk.column : `${root.name}_id`,
+        foreignKey: fk ? fk.columns : [`${root.name}_id`],
         as: pluralize(child.name),
         // A single-column UNIQUE/PRIMARY KEY constraint on the FK column
         // means at most one child row per parent (one-to-one) -- unless

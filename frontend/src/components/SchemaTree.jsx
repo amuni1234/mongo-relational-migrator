@@ -33,22 +33,49 @@ export default function SchemaTree({
     const table = schema.tables.find((t) => t.name === tableName);
     const defaultRefTable = selectableTables.find((t) => t.name !== tableName) || table;
     setFormState({
-      column: table.columns[0]?.name || "",
+      // One row per column pair -- most relationships are single-column,
+      // but "+ Add column pair" below lets a composite (multi-column) key
+      // be built up one pair at a time.
+      pairs: [{ column: table.columns[0]?.name || "", refColumn: defaultRefTable.columns[0]?.name || "" }],
       refTable: defaultRefTable.name,
-      refColumn: defaultRefTable.columns[0]?.name || "",
       unique: false,
     });
     setAddRelationshipOpenFor(tableName);
   }
 
+  function addColumnPair(tableName) {
+    const table = schema.tables.find((t) => t.name === tableName);
+    const refTable = schema.tables.find((t) => t.name === formState.refTable);
+    setFormState((f) => ({
+      ...f,
+      pairs: [...f.pairs, { column: table.columns[0]?.name || "", refColumn: refTable?.columns[0]?.name || "" }],
+    }));
+  }
+
+  function removeColumnPair(index) {
+    setFormState((f) => ({ ...f, pairs: f.pairs.filter((_, i) => i !== index) }));
+  }
+
+  function updatePair(index, field, value) {
+    setFormState((f) => ({
+      ...f,
+      pairs: f.pairs.map((p, i) => (i === index ? { ...p, [field]: value } : p)),
+    }));
+  }
+
   function isSelfReference(tableName) {
-    return tableName === formState.refTable && formState.column === formState.refColumn;
+    return tableName === formState.refTable && formState.pairs.some((p) => p.column === p.refColumn);
   }
 
   function submitAddRelationship(tableName) {
     if (isSelfReference(tableName)) return;
-    const { column, refTable, refColumn, unique } = formState;
-    onAddForeignKey(tableName, { column, refTable, refColumn, unique });
+    const { pairs, refTable, unique } = formState;
+    onAddForeignKey(tableName, {
+      columns: pairs.map((p) => p.column),
+      refTable,
+      refColumns: pairs.map((p) => p.refColumn),
+      unique,
+    });
     setAddRelationshipOpenFor(null);
   }
 
@@ -157,8 +184,8 @@ export default function SchemaTree({
           {table.foreignKeys.length > 0 && (
             <div className="cols" style={{ color: "var(--sql-amber)", marginTop: 6 }}>
               {table.foreignKeys.map((fk, i) => (
-                <div key={`${fk.column}-${fk.refTable}-${i}`}>
-                  FK: {fk.column} → {fk.refTable}.{fk.refColumn}
+                <div key={`${fk.columns.join(",")}-${fk.refTable}-${i}`}>
+                  FK: {fk.columns.join(", ")} → {fk.refTable}.({fk.refColumns.join(", ")})
                   {fk.synthetic && (
                     <>
                       {" "}
@@ -200,56 +227,89 @@ export default function SchemaTree({
                 borderRadius: 6,
               }}
             >
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                <label style={{ margin: 0 }}>
-                  Column
-                  <select
-                    value={formState.column}
-                    onChange={(e) => setFormState((f) => ({ ...f, column: e.target.value }))}
-                  >
-                    {table.columns.map((c) => (
-                      <option key={c.name} value={c.name}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <span>→</span>
-                <label style={{ margin: 0 }}>
-                  Table
-                  <select
-                    value={formState.refTable}
-                    onChange={(e) => {
-                      const refTable = schema.tables.find((t) => t.name === e.target.value);
-                      setFormState((f) => ({
-                        ...f,
-                        refTable: e.target.value,
-                        refColumn: refTable?.columns[0]?.name || "",
-                      }));
-                    }}
-                  >
-                    {selectableTables.map((t) => (
-                      <option key={t.name} value={t.name}>
-                        {t.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label style={{ margin: 0 }}>
-                  Column
-                  <select
-                    value={formState.refColumn}
-                    onChange={(e) => setFormState((f) => ({ ...f, refColumn: e.target.value }))}
-                  >
-                    {(selectableTables.find((t) => t.name === formState.refTable)?.columns || []).map(
-                      (c) => (
+              <label style={{ margin: 0 }}>
+                Table
+                <select
+                  value={formState.refTable}
+                  onChange={(e) => {
+                    const newRefTable = schema.tables.find((t) => t.name === e.target.value);
+                    setFormState((f) => ({
+                      ...f,
+                      refTable: e.target.value,
+                      // Old refColumn picks belonged to a different table --
+                      // reset every pair to the new table's first column.
+                      pairs: f.pairs.map((p) => ({
+                        ...p,
+                        refColumn: newRefTable?.columns[0]?.name || "",
+                      })),
+                    }));
+                  }}
+                >
+                  {selectableTables.map((t) => (
+                    <option key={t.name} value={t.name}>
+                      {t.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              {formState.pairs.map((pair, i) => (
+                <div
+                  key={i}
+                  style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 6 }}
+                >
+                  <label style={{ margin: 0 }}>
+                    Column
+                    <select value={pair.column} onChange={(e) => updatePair(i, "column", e.target.value)}>
+                      {table.columns.map((c) => (
                         <option key={c.name} value={c.name}>
                           {c.name}
                         </option>
-                      )
-                    )}
-                  </select>
-                </label>
+                      ))}
+                    </select>
+                  </label>
+                  <span>→</span>
+                  <label style={{ margin: 0 }}>
+                    Column
+                    <select
+                      value={pair.refColumn}
+                      onChange={(e) => updatePair(i, "refColumn", e.target.value)}
+                    >
+                      {(selectableTables.find((t) => t.name === formState.refTable)?.columns || []).map(
+                        (c) => (
+                          <option key={c.name} value={c.name}>
+                            {c.name}
+                          </option>
+                        )
+                      )}
+                    </select>
+                  </label>
+                  {formState.pairs.length > 1 && (
+                    <button
+                      className="er-unembed-btn"
+                      title="Remove this column pair"
+                      onClick={() => removeColumnPair(i)}
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              ))}
+
+              <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 10 }}>
+                <button
+                  className="btn secondary"
+                  style={{ padding: "4px 10px", fontSize: 12 }}
+                  onClick={() => addColumnPair(table.name)}
+                >
+                  + Add column pair
+                </button>
+                <span className="hint" style={{ margin: 0 }}>
+                  (only needed for a composite/multi-column key)
+                </span>
+              </div>
+
+              <div style={{ marginTop: 6 }}>
                 <span className="pill-toggle">
                   <button
                     className={!formState.unique ? "active" : ""}
