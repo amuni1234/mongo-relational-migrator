@@ -260,6 +260,34 @@ The downloaded `.py` script assumes:
     run still reads the full table via JDBC. A true incremental *extract*
     (only reading changed rows via a watermark column) is a separate,
     larger roadmap item.
+  - **Incremental (SCD2)** — preserves history instead of replacing in
+    place. Each incoming row gets a content hash (covering every real
+    column); rows whose hash matches the collection's current
+    (`isCurrent: true`) version are left untouched (zero writes). A
+    changed or brand-new row gets a fresh document inserted
+    (`isCurrent: true`, `validFrom: <now>`, `validTo: null`), while its
+    prior version — if one existed — is closed out via a **partial
+    update** (`isCurrent: false`, `validTo: <now>`), not a replace, so the
+    old document's content is preserved untouched as history. Matching for
+    that partial update is done on a generated `_versionId`
+    (`uuid()`), not MongoDB's own `_id` — the Spark Connector reads an
+    `_id` ObjectId back as a bare hex string with no type marker, and
+    writing that same string back does not get reinterpreted as the
+    original ObjectId, so matching on `_id` directly would silently insert
+    a brand-new malformed document instead of updating the existing one
+    (confirmed by testing both ways). Versioning applies to the **whole
+    joined document** — a change to an embedded child row (e.g. one
+    `addresses` entry) with no change to the parent row still produces a
+    new version of the entire customer document, since the content hash
+    covers the fully-joined result. One embed-specific correctness detail:
+    `collect_list`'s array order isn't stable across runs, which would make
+    the hash spuriously differ even with identical underlying data — SCD2
+    mode wraps many-cardinality embeds in `array_sort(...)` (with the
+    child's own primary key placed first in the struct, so plain
+    single-argument `array_sort` — the only form Spark 3.3/Glue 4.0
+    supports — sorts by it) to keep hashes stable. Like Incremental, SCD2
+    still reads the full source table every run; the efficiency gain here
+    is fewer/no-op MongoDB writes, not less reading from the source.
 
 Upload the script as the job's script location, set the `--JOB_NAME` job
 parameter (Glue does this automatically), and run.
@@ -333,12 +361,14 @@ Five larger items, in rough build order (smallest/most contained first):
    itself still reads everything (cheap metadata); the selection is a
    client-side filter (`workingSchema` in `App.jsx`) applied before the
    schema reaches Mapping or `/api/generate-glue-job`.
-2. ~~**Full vs. incremental load**~~ — **done** (upsert-by-primary-key
-   variant). A load-mode toggle in the Glue-job step generates either the
-   original `mode("overwrite")` script or one that upserts via
-   `mode("append")` + `idFieldList`. Doesn't yet reduce read volume via a
-   watermark column — see the "Load mode" bullet under "Using the generated
-   Glue job" above for the exact tradeoffs.
+2. ~~**Full vs. incremental load**~~ — **done**, three load modes. A
+   load-mode toggle in the Glue-job step generates the original
+   `mode("overwrite")` script, an upsert-by-primary-key variant
+   (`mode("append")` + `idFieldList`), or a Slowly Changing Dimension Type 2
+   (SCD2) variant that preserves history instead of replacing in place.
+   None of the three reduce read volume via a watermark column yet — see
+   the "Load mode" bullet under "Using the generated Glue job" above for
+   the exact tradeoffs of each.
 3. **Additional relational sources** — beyond Postgres/MySQL (e.g. SQL
    Server, Oracle). Each new engine needs its own `information_schema`-
    equivalent introspection queries and JDBC driver wired into the
@@ -357,9 +387,18 @@ Five larger items, in rough build order (smallest/most contained first):
 ## Known gaps
 
 - Glue-only — no EMR/Dataproc generator yet
-- Incremental load upserts but never deletes (a source row deletion doesn't
-  remove the corresponding Mongo document), and doesn't reduce read volume
-  (no watermark-based incremental extract yet)
+- Neither Incremental nor SCD2 delete a target document whose source row was
+  deleted, and neither reduces read volume (no watermark-based incremental
+  extract yet — every run still reads the full source table via JDBC)
+- MongoDB's own `_id` (a BSON ObjectId) doesn't round-trip cleanly through
+  the Spark Connector — reading it back gives a bare hex string with no
+  type marker, and writing that string back doesn't get reinterpreted as
+  the original ObjectId (confirmed by testing: `idFieldList="_id"` silently
+  inserted a new malformed document instead of matching the existing one).
+  SCD2's own version-matching works around this with a self-generated
+  `_versionId` field instead of `_id`; keep this in mind if extending any
+  future feature that needs to reference a specific existing document by
+  its Mongo `_id` from within Spark.
 - Postgres introspection hardcodes the `public` schema
 - No check-constraint discovery
 - No persistence — schema/mapping only live in browser memory for the

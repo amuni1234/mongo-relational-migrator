@@ -37,6 +37,111 @@ function castSelectLines(varName, table) {
   return `${varName} = ${varName}.select(\n    ${castExprs.join(",\n    ")}\n)`;
 }
 
+// SCD2 needs a few extra pyspark functions the other two modes don't --
+// only pulled in when SCD2 is actually selected, so Full/Incremental
+// scripts don't carry unused imports.
+const PYSPARK_FUNCTIONS_BY_MODE = {
+  full: "collect_list, struct, col",
+  incremental: "collect_list, struct, col",
+  scd2: "collect_list, struct, col, sha2, concat_ws, current_timestamp, lit, array_sort, expr",
+};
+
+// Appended to write_to_mongo's body only when SCD2 is selected -- compares
+// each incoming row's content hash against the collection's current
+// (isCurrent=true) documents: unchanged rows are dropped, changed/new rows
+// close out their prior version (a partial update, not a replace, so the
+// old document's content is preserved untouched as history) and get a
+// fresh current version inserted.
+const WRITE_SCD2_FUNCTION = `
+
+def _write_scd2(new_df, collection_name, business_key_cols):
+    content_cols = new_df.columns
+    new_df = new_df.withColumn(
+        "_contentHash", sha2(concat_ws("||", *[col(c).cast("string") for c in content_cols]), 256)
+    )
+
+    current_df = (
+        spark.read.format("mongodb")
+        .option("connection.uri", MONGO_URI)
+        .option("database", MONGO_DATABASE)
+        .option("collection", collection_name)
+        .load()
+    )
+    current_live = (
+        current_df.filter(col("isCurrent") == True)
+        if "isCurrent" in current_df.columns
+        else current_df.limit(0)
+    )
+
+    if current_live.rdd.isEmpty():
+        to_insert = (
+            new_df.withColumn("_versionId", expr("uuid()"))
+            .withColumn("isCurrent", lit(True))
+            .withColumn("validFrom", current_timestamp())
+            .withColumn("validTo", lit(None).cast("timestamp"))
+        )
+        (
+            to_insert.write.format("mongodb")
+            .mode("append")
+            .option("connection.uri", MONGO_URI)
+            .option("database", MONGO_DATABASE)
+            .option("collection", collection_name)
+            .save()
+        )
+        return
+
+    # Match on our own plain-string _versionId, not MongoDB's own _id -- the
+    # Spark Connector reads an ObjectId _id back as a bare hex string with
+    # no type marker, and writing that same string back doesn't get
+    # reinterpreted as the original ObjectId, so idFieldList="_id" would
+    # silently insert a brand new document instead of matching the existing
+    # one. A field we generate and control end-to-end (uuid(), a plain
+    # string both ways) avoids that round-trip problem entirely.
+    joined = new_df.join(
+        current_live.select(
+            *business_key_cols,
+            col("_contentHash").alias("_oldHash"),
+            col("_versionId").alias("_oldVersionId"),
+        ),
+        on=business_key_cols,
+        how="left",
+    )
+    changed_or_new = joined.filter(col("_oldHash").isNull() | (col("_oldHash") != col("_contentHash")))
+
+    to_close = changed_or_new.filter(col("_oldVersionId").isNotNull()).select(
+        col("_oldVersionId").alias("_versionId"),
+        lit(False).alias("isCurrent"),
+        current_timestamp().alias("validTo"),
+    )
+    if not to_close.rdd.isEmpty():
+        (
+            to_close.write.format("mongodb")
+            .mode("append")
+            .option("operationType", "update")
+            .option("idFieldList", "_versionId")
+            .option("connection.uri", MONGO_URI)
+            .option("database", MONGO_DATABASE)
+            .option("collection", collection_name)
+            .save()
+        )
+
+    to_insert = (
+        changed_or_new.select(*new_df.columns)
+        .withColumn("_versionId", expr("uuid()"))
+        .withColumn("isCurrent", lit(True))
+        .withColumn("validFrom", current_timestamp())
+        .withColumn("validTo", lit(None).cast("timestamp"))
+    )
+    (
+        to_insert.write.format("mongodb")
+        .mode("append")
+        .option("connection.uri", MONGO_URI)
+        .option("database", MONGO_DATABASE)
+        .option("collection", collection_name)
+        .save()
+    )
+`;
+
 function generateGlueJob({ jdbc, mongo, schema, mapping, loadMode = "full" }) {
   const tableByName = new Map(schema.tables.map((t) => [t.name, t]));
 
@@ -55,6 +160,14 @@ ${
       "rows, updates changed ones) but does NOT delete target documents whose\n" +
       "source row was deleted, and does NOT reduce how much is read from the\n" +
       "source -- every run still reads the full table via JDBC."
+    : loadMode === "scd2"
+    ? "Incremental (SCD2): preserves history instead of replacing in place --\n" +
+      "an unchanged row is left alone, a changed or new row gets a fresh\n" +
+      "current version inserted while its prior version is marked no-longer-\n" +
+      "current (isCurrent=false, validTo=<now>) rather than overwritten. Like\n" +
+      "Incremental, this still reads the full table via JDBC every run -- the\n" +
+      "efficiency gain here is fewer/no-op MongoDB writes when nothing changed,\n" +
+      "not less reading from the source."
     : "Full: drops/truncates each target collection before writing (the MongoDB\nSpark Connector's default behavior for mode(\"overwrite\"))."
 }
 """
@@ -65,7 +178,7 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql.functions import collect_list, struct, col
+from pyspark.sql.functions import ${PYSPARK_FUNCTIONS_BY_MODE[loadMode] || PYSPARK_FUNCTIONS_BY_MODE.full}
 
 args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 sc = SparkContext()
@@ -86,9 +199,8 @@ MONGO_URI = ${pythonStr(mongo.uri)}
 MONGO_DATABASE = ${pythonStr(mongo.database)}
 
 # "full" drops/truncates each target collection before writing; "incremental"
-# upserts by primary key instead (idempotent re-runs, but doesn't delete
-# target documents whose source row was deleted, and doesn't reduce how much
-# is read from the source -- every run still reads the full table via JDBC).
+# upserts by primary key instead; "scd2" preserves history (see docstring
+# above for the full tradeoffs of each).
 LOAD_MODE = ${pythonStr(loadMode)}
 
 # Resolve the JDBC password from AWS Secrets Manager at runtime rather than
@@ -112,6 +224,9 @@ def read_table(table_name):
 
 
 def write_to_mongo(df, collection_name, id_field_list=None):
+    if LOAD_MODE == "scd2" and id_field_list:
+        _write_scd2(df, collection_name, id_field_list.split(","))
+        return
     writer = df.write.format("mongodb")
     if LOAD_MODE == "incremental" and id_field_list:
         # Upsert: replace a document matching id_field_list's value, insert
@@ -127,11 +242,11 @@ def write_to_mongo(df, collection_name, id_field_list=None):
         .option("collection", collection_name)
         .save()
     )
-
+${loadMode === "scd2" ? WRITE_SCD2_FUNCTION : ""}
 `;
 
   const collectionBlocks = mapping.collections
-    .map((collection) => generateCollectionBlock(collection, tableByName))
+    .map((collection) => generateCollectionBlock(collection, tableByName, loadMode))
     .join("\n\n");
 
   const footer = `
@@ -142,7 +257,7 @@ job.commit()
   return header + collectionBlocks + footer;
 }
 
-function generateCollectionBlock(collection, tableByName) {
+function generateCollectionBlock(collection, tableByName, loadMode) {
   const rootVar = toVar(collection.rootTable);
   const rootTable = tableByName.get(collection.rootTable);
   const lines = [];
@@ -163,9 +278,16 @@ function generateCollectionBlock(collection, tableByName) {
 
     const childVar = toVar(embed.table);
     const nestedVar = `${childVar}_nested`;
+    const childPk = childTable.primaryKey && childTable.primaryKey[0];
+    // Primary key first, everything else keeping its original relative
+    // order -- lets plain array_sort(...) (single-argument; Spark 3.3/Glue
+    // 4.0 doesn't support the 2-argument custom-comparator form added in
+    // Spark 3.4) sort structs by their first field and get "sorted by PK"
+    // for free, with no comparator needed.
     const nonKeyCols = childTable.columns
       .filter((c) => c.name !== embed.foreignKey)
-      .map((c) => c.name);
+      .map((c) => c.name)
+      .sort((a, b) => (a === childPk ? -1 : b === childPk ? 1 : 0));
 
     const structFields = nonKeyCols
       .map((c) => `col(${pythonStr(c)}).alias(${pythonStr(c)})`)
@@ -182,9 +304,21 @@ function generateCollectionBlock(collection, tableByName) {
         `${nestedVar} = ${childVar}.select(col(${pythonStr(embed.foreignKey)}).alias("_join_key"), struct(${structFields}).alias(${pythonStr(embed.as)}))`
       );
     } else {
-      // 1:many -> embed as an array of nested objects per row.
+      // 1:many -> embed as an array of nested objects per row. In SCD2 mode,
+      // collect_list's element order isn't stable across runs (Spark's
+      // shuffle can reorder identical data differently run to run), which
+      // would make the content hash spuriously differ even when nothing
+      // changed -- wrap in array_sort (structs sort by their first field,
+      // which nonKeyCols above guarantees is the child's own primary key)
+      // so identical data always serializes/hashes identically. Not needed
+      // for Full/Incremental, which don't compare content.
+      const collectExpr = `collect_list(struct(${structFields}))`;
+      const orderedCollectExpr =
+        loadMode === "scd2" && childPk && nonKeyCols.includes(childPk)
+          ? `array_sort(${collectExpr})`
+          : collectExpr;
       lines.push(
-        `${nestedVar} = ${childVar}.groupBy(col(${pythonStr(embed.foreignKey)}).alias("_join_key")).agg(collect_list(struct(${structFields})).alias(${pythonStr(embed.as)}))`
+        `${nestedVar} = ${childVar}.groupBy(col(${pythonStr(embed.foreignKey)}).alias("_join_key")).agg(${orderedCollectExpr}.alias(${pythonStr(embed.as)}))`
       );
     }
 

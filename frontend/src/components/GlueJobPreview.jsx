@@ -68,11 +68,17 @@ export default function GlueJobPreview({ dbType, connection, onGenerate, script,
         >
           Incremental (upsert)
         </button>
+        <button className={loadMode === "scd2" ? "active" : ""} onClick={() => setLoadMode("scd2")}>
+          Incremental (SCD2)
+        </button>
       </span>
       <p className="hint" style={{ marginTop: 4 }}>
-        {loadMode === "full"
-          ? "Drops/truncates each target collection before writing -- safe for a first load, destructive on re-runs."
-          : "Upserts by each collection's primary key -- safe to re-run, but doesn't delete target documents whose source row was deleted, and doesn't reduce how much is read from the source."}
+        {loadMode === "full" &&
+          "Drops/truncates each target collection before writing -- safe for a first load, destructive on re-runs."}
+        {loadMode === "incremental" &&
+          "Upserts by each collection's primary key -- safe to re-run, but doesn't delete target documents whose source row was deleted, and doesn't reduce how much is read from the source."}
+        {loadMode === "scd2" &&
+          "Preserves history instead of replacing in place -- a changed or new row gets a fresh current version, its prior version is kept and marked no-longer-current rather than overwritten. Still reads the full source table every run; writes nothing for rows that haven't changed."}
       </p>
 
       <div className="grid-2">

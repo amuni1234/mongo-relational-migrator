@@ -105,9 +105,9 @@
                   "mapping": { "$ref": "#/components/schemas/Mapping" },
                   "loadMode": {
                     "type": "string",
-                    "enum": ["full", "incremental"],
+                    "enum": ["full", "incremental", "scd2"],
                     "default": "full",
-                    "description": "\"full\" drops/truncates each target collection before writing (mode(\"overwrite\")). \"incremental\" upserts by each collection's primary key instead (mode(\"append\") + idFieldList) -- idempotent re-runs, but doesn't delete target documents whose source row was deleted, and doesn't reduce how much is read from the source."
+                    "description": "\"full\" drops/truncates each target collection before writing (mode(\"overwrite\")). \"incremental\" upserts by each collection's primary key instead (mode(\"append\") + idFieldList) -- idempotent re-runs, but doesn't delete target documents whose source row was deleted, and doesn't reduce how much is read from the source. \"scd2\" preserves history instead of replacing in place: an unchanged row is left alone, a changed/new row gets a fresh current version inserted (isCurrent=true) while its prior version is marked no-longer-current (isCurrent=false, validTo=<now>) via a partial update rather than overwritten -- still reads the full source table every run like incremental, but writes nothing for unchanged rows and preserves history for changed ones."
                   }
                 }
               },
