@@ -244,9 +244,22 @@ The downloaded `.py` script assumes:
   UI — the script's IAM role needs `secretsmanager:GetSecretValue` on it
 - Standard JDBC driver JARs (Postgres/MySQL) available to the job, same as
   any other Glue JDBC connection
-- Writes use `mode("overwrite")` — there is no incremental/idempotent write
-  strategy yet, so re-runs replace the target collection's contents rather
-  than upserting
+- **Load mode**, chosen in the wizard's Glue job step:
+  - **Full** (default) — `mode("overwrite")`, which drops/truncates each
+    target collection before writing. Safe for a first load; destructive on
+    re-runs.
+  - **Incremental** — `mode("append")` + the MongoDB Spark Connector's
+    `idFieldList` option set to each collection's primary key, so re-runs
+    upsert (replace-if-matched, insert-if-not) instead of wiping the
+    collection first. `operationType`/`upsertDocument` are left at the
+    connector's own defaults (`replace`/`true`), which already implement
+    this — no need to set them explicitly. **Two things incremental does
+    NOT do**: it doesn't delete target documents whose source row was
+    deleted (a row removed from Postgres/MySQL leaves its Mongo document
+    behind), and it doesn't reduce how much is read from the source — every
+    run still reads the full table via JDBC. A true incremental *extract*
+    (only reading changed rows via a watermark column) is a separate,
+    larger roadmap item.
 
 Upload the script as the job's script location, set the `--JOB_NAME` job
 parameter (Glue does this automatically), and run.
@@ -320,10 +333,12 @@ Five larger items, in rough build order (smallest/most contained first):
    itself still reads everything (cheap metadata); the selection is a
    client-side filter (`workingSchema` in `App.jsx`) applied before the
    schema reaches Mapping or `/api/generate-glue-job`.
-2. **Full vs. incremental load** — an incremental write strategy (e.g.
-   upsert by primary key, or a watermark/last-modified column) alongside
-   today's full-overwrite-only `mode("overwrite")`. Touches
-   `glueJobGenerator.js` and the Glue-job step's UI.
+2. ~~**Full vs. incremental load**~~ — **done** (upsert-by-primary-key
+   variant). A load-mode toggle in the Glue-job step generates either the
+   original `mode("overwrite")` script or one that upserts via
+   `mode("append")` + `idFieldList`. Doesn't yet reduce read volume via a
+   watermark column — see the "Load mode" bullet under "Using the generated
+   Glue job" above for the exact tradeoffs.
 3. **Additional relational sources** — beyond Postgres/MySQL (e.g. SQL
    Server, Oracle). Each new engine needs its own `information_schema`-
    equivalent introspection queries and JDBC driver wired into the
@@ -342,7 +357,9 @@ Five larger items, in rough build order (smallest/most contained first):
 ## Known gaps
 
 - Glue-only — no EMR/Dataproc generator yet
-- Writes use `mode("overwrite")` — no incremental/idempotent write strategy
+- Incremental load upserts but never deletes (a source row deletion doesn't
+  remove the corresponding Mongo document), and doesn't reduce read volume
+  (no watermark-based incremental extract yet)
 - Postgres introspection hardcodes the `public` schema
 - No check-constraint discovery
 - No persistence — schema/mapping only live in browser memory for the

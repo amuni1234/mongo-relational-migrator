@@ -13,6 +13,7 @@ export default function GlueJobPreview({ dbType, connection, onGenerate, script,
   const [secretName, setSecretName] = useState("prod/jdbc/password");
   const [mongoUri, setMongoUri] = useState("mongodb+srv://<cluster-uri>");
   const [mongoDb, setMongoDb] = useState("migrated_db");
+  const [loadMode, setLoadMode] = useState("full");
 
   function buildJdbcUrl() {
     if (dbType === "postgres") {
@@ -33,6 +34,7 @@ export default function GlueJobPreview({ dbType, connection, onGenerate, script,
         uri: mongoUri,
         database: mongoDb,
       },
+      loadMode,
     });
   }
 
@@ -53,6 +55,24 @@ export default function GlueJobPreview({ dbType, connection, onGenerate, script,
         Produces a Glue 4.0 PySpark script. Add the MongoDB Spark Connector
         as a job dependency and store the JDBC password in Secrets Manager
         under the name you give below — the script resolves it at runtime.
+      </p>
+
+      <label>Load mode</label>
+      <span className="pill-toggle" style={{ marginBottom: 6 }}>
+        <button className={loadMode === "full" ? "active" : ""} onClick={() => setLoadMode("full")}>
+          Full (overwrite)
+        </button>
+        <button
+          className={loadMode === "incremental" ? "active" : ""}
+          onClick={() => setLoadMode("incremental")}
+        >
+          Incremental (upsert)
+        </button>
+      </span>
+      <p className="hint" style={{ marginTop: 4 }}>
+        {loadMode === "full"
+          ? "Drops/truncates each target collection before writing -- safe for a first load, destructive on re-runs."
+          : "Upserts by each collection's primary key -- safe to re-run, but doesn't delete target documents whose source row was deleted, and doesn't reduce how much is read from the source."}
       </p>
 
       <div className="grid-2">

@@ -102,14 +102,21 @@
                   "jdbc": { "$ref": "#/components/schemas/JdbcConfig" },
                   "mongo": { "$ref": "#/components/schemas/MongoTarget" },
                   "schema": { "$ref": "#/components/schemas/Schema" },
-                  "mapping": { "$ref": "#/components/schemas/Mapping" }
+                  "mapping": { "$ref": "#/components/schemas/Mapping" },
+                  "loadMode": {
+                    "type": "string",
+                    "enum": ["full", "incremental"],
+                    "default": "full",
+                    "description": "\"full\" drops/truncates each target collection before writing (mode(\"overwrite\")). \"incremental\" upserts by each collection's primary key instead (mode(\"append\") + idFieldList) -- idempotent re-runs, but doesn't delete target documents whose source row was deleted, and doesn't reduce how much is read from the source."
+                  }
                 }
               },
               "example": {
                 "jdbc": { "url": "jdbc:postgresql://localhost:5433/postgres", "user": "postgres", "driver": "org.postgresql.Driver", "passwordSecretName": "test-secret" },
                 "mongo": { "uri": "mongodb://localhost:27017", "database": "migrator_test" },
                 "schema": { "tables": [] },
-                "mapping": { "collections": [] }
+                "mapping": { "collections": [] },
+                "loadMode": "full"
               }
             }
           }

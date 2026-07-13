@@ -56,18 +56,18 @@ router.post("/suggest-mapping", (req, res) => {
 
 /**
  * POST /api/generate-glue-job
- * body: { jdbc: {...}, mongo: {...}, schema: {...}, mapping: {...} }
+ * body: { jdbc: {...}, mongo: {...}, schema: {...}, mapping: {...}, loadMode?: "full" | "incremental" }
  * -> { script: "<python source>" }
  */
 router.post("/generate-glue-job", (req, res) => {
   try {
-    const { jdbc, mongo, schema, mapping } = req.body;
+    const { jdbc, mongo, schema, mapping, loadMode } = req.body;
     if (!jdbc || !mongo || !schema || !mapping) {
       return res
         .status(400)
         .json({ error: "jdbc, mongo, schema, and mapping are all required" });
     }
-    const script = generateGlueJob({ jdbc, mongo, schema, mapping });
+    const script = generateGlueJob({ jdbc, mongo, schema, mapping, loadMode });
     res.json({ script });
   } catch (err) {
     res.status(500).json({ error: err.message });

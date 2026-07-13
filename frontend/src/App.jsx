@@ -122,11 +122,11 @@ export default function App() {
     };
   }, [schema, selectedTableNames]);
 
-  async function handleGenerateGlueJob({ jdbc, mongo }) {
+  async function handleGenerateGlueJob({ jdbc, mongo, loadMode }) {
     setError(null);
     setLoading(true);
     try {
-      const result = await api.generateGlueJob({ jdbc, mongo, schema: workingSchema, mapping });
+      const result = await api.generateGlueJob({ jdbc, mongo, schema: workingSchema, mapping, loadMode });
       setScript(result.script);
     } catch (err) {
       setError(err.message);
