@@ -16,7 +16,8 @@ export default function ConnectionForm({ onIntrospect, loading }) {
 
   function handleDbTypeChange(value) {
     setDbType(value);
-    update("port", value === "postgres" ? "5432" : "3306");
+    const defaultPort = { postgres: "5432", mysql: "3306", mssql: "1433" };
+    update("port", defaultPort[value] || form.port);
   }
 
   function submit(e) {
@@ -43,6 +44,10 @@ export default function ConnectionForm({ onIntrospect, loading }) {
         <select value={dbType} onChange={(e) => handleDbTypeChange(e.target.value)}>
           <option value="postgres">PostgreSQL</option>
           <option value="mysql">MySQL</option>
+          <option value="mssql">SQL Server</option>
+          <option value="oracle" disabled>
+            Oracle (coming soon)
+          </option>
         </select>
 
         <div className="grid-2">

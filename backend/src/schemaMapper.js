@@ -78,6 +78,9 @@ function suggestMapping(schema) {
       primaryKey: root.primaryKey,
       embeds,
       references,
+      // Populated later by the user in the Mapping step UI -- the backend
+      // doesn't suggest computed columns, only embed/reference structure.
+      computedColumns: [],
     };
   });
 

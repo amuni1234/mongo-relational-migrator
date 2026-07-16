@@ -3,6 +3,8 @@ const { introspect } = require("../introspect");
 const { suggestMapping } = require("../schemaMapper");
 const { generateGlueJob } = require("../generators/glueJobGenerator");
 const { testLoad } = require("../mongoLoader");
+const { deployToAwsGlue } = require("../deploy/awsGlueDeployer");
+const { deployToGcpDataproc } = require("../deploy/gcpDataprocDeployer");
 
 const router = express.Router();
 
@@ -56,18 +58,18 @@ router.post("/suggest-mapping", (req, res) => {
 
 /**
  * POST /api/generate-glue-job
- * body: { jdbc: {...}, mongo: {...}, schema: {...}, mapping: {...} }
+ * body: { jdbc: {...}, mongo: {...}, schema: {...}, mapping: {...}, loadStrategy?: {...} }
  * -> { script: "<python source>" }
  */
 router.post("/generate-glue-job", (req, res) => {
   try {
-    const { jdbc, mongo, schema, mapping } = req.body;
+    const { jdbc, mongo, schema, mapping, loadStrategy } = req.body;
     if (!jdbc || !mongo || !schema || !mapping) {
       return res
         .status(400)
         .json({ error: "jdbc, mongo, schema, and mapping are all required" });
     }
-    const script = generateGlueJob({ jdbc, mongo, schema, mapping });
+    const script = generateGlueJob({ jdbc, mongo, schema, mapping, loadStrategy });
     res.json({ script });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -91,6 +93,31 @@ router.post("/test-load", async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/deploy-job
+ * body: { target: "aws-glue", script, jobName, region, s3Bucket, s3Key, roleArn, ... }
+ *    or { target: "gcp-dataproc", ... }  (not yet implemented -> 501)
+ * -> { jobName, jobRunId, consoleUrl, ... } for aws-glue
+ */
+router.post("/deploy-job", async (req, res) => {
+  try {
+    const { target, ...options } = req.body;
+    if (!target) return res.status(400).json({ error: "target is required" });
+
+    if (target === "aws-glue") {
+      const result = await deployToAwsGlue(options);
+      return res.json(result);
+    }
+    if (target === "gcp-dataproc") {
+      const result = await deployToGcpDataproc(options);
+      return res.json(result);
+    }
+    return res.status(400).json({ error: `Unknown deploy target: ${target}` });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 

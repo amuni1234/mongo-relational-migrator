@@ -50,6 +50,9 @@ export default function MappingCanvas({
   // more than one FK), keyed by the root collection's table name, so we can
   // pass them through to the final mapping instead of always emitting [].
   const [referencesByRoot, setReferencesByRoot] = useState({});
+  // User-defined derived columns per root collection (e.g. "full_name" from
+  // an expression, or a "loaded_at" column defaulting to current_timestamp).
+  const [computedColumnsByRoot, setComputedColumnsByRoot] = useState({});
   const [usingLocalFallback, setUsingLocalFallback] = useState(false);
 
   const [selected, setSelected] = useState(schema.tables[0]?.name || null);
@@ -64,13 +67,18 @@ export default function MappingCanvas({
     if (seededRef.current) return;
 
     if (suggestedMapping) {
-      const { embeddedIn: seedEmbeds, collectionNames: seedNames, referencesByRoot: seedRefs } =
-        fromSuggestedMapping(schema, suggestedMapping);
+      const {
+        embeddedIn: seedEmbeds,
+        collectionNames: seedNames,
+        referencesByRoot: seedRefs,
+        computedColumnsByRoot: seedComputed,
+      } = fromSuggestedMapping(schema, suggestedMapping);
       seededRef.current = true;
       setEmbeddedIn(seedEmbeds);
       setCollectionNames(seedNames);
       setReferencesByRoot(seedRefs);
-      onChange(buildLegacyMapping(schema, seedEmbeds, seedNames, seedRefs));
+      setComputedColumnsByRoot(seedComputed);
+      onChange(buildLegacyMapping(schema, seedEmbeds, seedNames, seedRefs, seedComputed));
       return;
     }
 
@@ -82,7 +90,8 @@ export default function MappingCanvas({
       setEmbeddedIn(seedEmbeds);
       setCollectionNames(seedNames);
       setReferencesByRoot({});
-      onChange(buildLegacyMapping(schema, seedEmbeds, seedNames, {}));
+      setComputedColumnsByRoot({});
+      onChange(buildLegacyMapping(schema, seedEmbeds, seedNames, {}, {}));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [suggestedMapping, usingLocalFallback]);
@@ -160,7 +169,34 @@ export default function MappingCanvas({
   }
 
   function emitChange(embedState, nameState) {
-    onChange(buildLegacyMapping(schema, embedState, nameState, referencesByRoot));
+    onChange(buildLegacyMapping(schema, embedState, nameState, referencesByRoot, computedColumnsByRoot));
+  }
+
+  function addComputedColumn(rootTable) {
+    const next = {
+      ...computedColumnsByRoot,
+      [rootTable]: [
+        ...(computedColumnsByRoot[rootTable] || []),
+        { name: "", kind: "expression", expression: "" },
+      ],
+    };
+    setComputedColumnsByRoot(next);
+    onChange(buildLegacyMapping(schema, embeddedIn, collectionNames, referencesByRoot, next));
+  }
+
+  function updateComputedColumn(rootTable, index, patch) {
+    const list = [...(computedColumnsByRoot[rootTable] || [])];
+    list[index] = { ...list[index], ...patch };
+    const next = { ...computedColumnsByRoot, [rootTable]: list };
+    setComputedColumnsByRoot(next);
+    onChange(buildLegacyMapping(schema, embeddedIn, collectionNames, referencesByRoot, next));
+  }
+
+  function removeComputedColumn(rootTable, index) {
+    const list = (computedColumnsByRoot[rootTable] || []).filter((_, i) => i !== index);
+    const next = { ...computedColumnsByRoot, [rootTable]: list };
+    setComputedColumnsByRoot(next);
+    onChange(buildLegacyMapping(schema, embeddedIn, collectionNames, referencesByRoot, next));
   }
 
   function handleDragStart(e, tableName) {
@@ -383,6 +419,71 @@ export default function MappingCanvas({
               <div className="hint" style={{ marginTop: 14 }}>
                 Related tables: {relatedTablesFor(selectedTable.name).join(", ") || "none"}
               </div>
+
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18 }}>
+                <label style={{ margin: 0 }}>Computed columns</label>
+                <button
+                  className="btn secondary"
+                  style={{ padding: "4px 10px", fontSize: 12 }}
+                  onClick={() => addComputedColumn(findRoot(selectedTable.name))}
+                >
+                  + Add computed column
+                </button>
+              </div>
+              <p className="hint" style={{ marginTop: 4 }}>
+                Derived fields added at load time — e.g. combine two columns,
+                or stamp a default like the current date.
+              </p>
+
+              {(computedColumnsByRoot[findRoot(selectedTable.name)] || []).map((cc, i) => {
+                const rootName = findRoot(selectedTable.name);
+                return (
+                  <div
+                    key={i}
+                    style={{
+                      border: "1px solid var(--border)",
+                      borderRadius: 8,
+                      padding: 10,
+                      marginBottom: 8,
+                    }}
+                  >
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <input
+                        type="text"
+                        placeholder="column name"
+                        value={cc.name}
+                        onChange={(e) => updateComputedColumn(rootName, i, { name: e.target.value })}
+                        style={{ flex: 1 }}
+                      />
+                      <button
+                        className="er-unembed-btn"
+                        onClick={() => removeComputedColumn(rootName, i)}
+                        title="Remove computed column"
+                      >
+                        🗑
+                      </button>
+                    </div>
+                    <select
+                      value={cc.kind}
+                      onChange={(e) => updateComputedColumn(rootName, i, { kind: e.target.value })}
+                      style={{ marginTop: 6 }}
+                    >
+                      <option value="expression">Expression (e.g. col_a + col_b)</option>
+                      <option value="default_current_date">Default: current date</option>
+                      <option value="default_current_timestamp">Default: current timestamp</option>
+                    </select>
+                    {cc.kind === "expression" && (
+                      <input
+                        type="text"
+                        placeholder="e.g. price * quantity"
+                        value={cc.expression}
+                        onChange={(e) => updateComputedColumn(rootName, i, { expression: e.target.value })}
+                        style={{ marginTop: 6 }}
+                      />
+                    )}
+                  </div>
+                );
+              })}
             </>
           )}
         </div>
@@ -416,7 +517,7 @@ function inferInitialEmbeds(schema) {
 // `referencesByRoot` (tableName -> reference entries, as returned by the
 // backend's /suggest-mapping) is passed through unchanged for any root the
 // user hasn't touched, instead of always emitting an empty references: [].
-function buildLegacyMapping(schema, embeddedIn, collectionNames, referencesByRoot = {}) {
+function buildLegacyMapping(schema, embeddedIn, collectionNames, referencesByRoot = {}, computedColumnsByRoot = {}) {
   const topLevel = schema.tables.filter((t) => !embeddedIn[t.name]);
 
   const collections = topLevel.map((root) => {
@@ -438,12 +539,16 @@ function buildLegacyMapping(schema, embeddedIn, collectionNames, referencesByRoo
     const references = (referencesByRoot[root.name] || []).filter(
       (ref) => !embeddedIn[ref.table]
     );
+    // Drop any half-filled computed columns (no name yet) so a blank "+ Add"
+    // row doesn't leak into the generated script.
+    const computedColumns = (computedColumnsByRoot[root.name] || []).filter((cc) => cc.name?.trim());
     return {
       collectionName: collectionNames[root.name] || pluralize(root.name),
       rootTable: root.name,
       primaryKey: root.primaryKey,
       embeds,
       references,
+      computedColumns,
     };
   });
 
@@ -451,12 +556,14 @@ function buildLegacyMapping(schema, embeddedIn, collectionNames, referencesByRoo
 }
 
 // Converts a backend /suggest-mapping response ({ collections: [{ rootTable,
-// collectionName, embeds, references }] }) into the { embeddedIn,
-// collectionNames, referencesByRoot } shape the canvas keeps as state.
+// collectionName, embeds, references, computedColumns }] }) into the
+// { embeddedIn, collectionNames, referencesByRoot, computedColumnsByRoot }
+// shape the canvas keeps as state.
 function fromSuggestedMapping(schema, suggestedMapping) {
   const embeddedIn = {};
   const collectionNames = {};
   const referencesByRoot = {};
+  const computedColumnsByRoot = {};
   const knownTables = new Set(schema.tables.map((t) => t.name));
 
   for (const collection of suggestedMapping.collections || []) {
@@ -472,6 +579,9 @@ function fromSuggestedMapping(schema, suggestedMapping) {
         knownTables.has(ref.table)
       );
     }
+    if (collection.computedColumns && collection.computedColumns.length) {
+      computedColumnsByRoot[collection.rootTable] = collection.computedColumns;
+    }
   }
 
   // Any table the backend didn't mention at all (shouldn't normally happen,
@@ -481,5 +591,5 @@ function fromSuggestedMapping(schema, suggestedMapping) {
     if (!(t.name in collectionNames)) collectionNames[t.name] = pluralize(t.name);
   }
 
-  return { embeddedIn, collectionNames, referencesByRoot };
+  return { embeddedIn, collectionNames, referencesByRoot, computedColumnsByRoot };
 }

@@ -24,4 +24,5 @@ export const api = {
   generateGlueJob: (payload) => post("/generate-glue-job", payload),
   testLoad: (payload) => post("/test-load", payload),
   mongoDefaults: () => get("/mongo-defaults"),
+  deployJob: (payload) => post("/deploy-job", payload),
 };

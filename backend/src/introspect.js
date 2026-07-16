@@ -6,20 +6,12 @@
  *   tables: [
  *     {
  *       name: "customers",
- *       // `bsonType` is a suggested target MongoDB/BSON type inferred from
- *       // `dataType` (see bsonTypeMapper.js) -- editable by the user in the
- *       // Schema step; introspect() only ever sets the inferred default.
- *       // `bsonTypeConfident` is false when dataType wasn't recognized and
- *       // the "string" fallback was used.
- *       columns: [{ name, dataType, nullable, isPrimaryKey, bsonType, bsonTypeConfident }],
+ *       columns: [{ name, dataType, nullable, isPrimaryKey }],
  *       primaryKey: ["id"],
  *       // `unique` is true when `column` is covered by a single-column
  *       // UNIQUE or PRIMARY KEY constraint on this table, i.e. the FK
  *       // relationship is one-to-one/one-to-zero rather than one-to-many.
- *       // `synthetic` (added by the UI, never set by introspect() itself)
- *       // marks a relationship the user manually declared because no real
- *       // FK constraint exists in the source database for it.
- *       foreignKeys: [{ column, refTable, refColumn, unique, synthetic }]
+ *       foreignKeys: [{ column, refTable, refColumn, unique }]
  *     },
  *     ...
  *   ]
@@ -32,7 +24,7 @@
 
 const { Client } = require("pg");
 const mysql = require("mysql2/promise");
-const { inferDefaultBsonType } = require("./bsonTypeMapper");
+const mssql = require("mssql");
 
 async function introspectPostgres(connectionConfig) {
   const client = new Client(connectionConfig);
@@ -184,7 +176,83 @@ async function introspectMysql(connectionConfig) {
   }
 }
 
-// Groups constraint rows by (table, constraint) to find constraints that
+async function introspectMssql(connectionConfig) {
+  const pool = await mssql.connect({
+    server: connectionConfig.host,
+    port: connectionConfig.port,
+    user: connectionConfig.user,
+    password: connectionConfig.password,
+    database: connectionConfig.database,
+    options: { encrypt: connectionConfig.encrypt ?? true, trustServerCertificate: true },
+  });
+
+  try {
+    const columnsRes = await pool.request().query(`
+      SELECT
+        c.TABLE_NAME  AS table_name,
+        c.COLUMN_NAME AS column_name,
+        c.DATA_TYPE   AS data_type,
+        c.IS_NULLABLE AS is_nullable,
+        CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS is_primary_key
+      FROM INFORMATION_SCHEMA.COLUMNS c
+      LEFT JOIN (
+        SELECT ku.TABLE_NAME, ku.COLUMN_NAME
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku
+          ON tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+      ) pk ON pk.TABLE_NAME = c.TABLE_NAME AND pk.COLUMN_NAME = c.COLUMN_NAME
+      ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION;
+    `);
+
+    const fkRes = await pool.request().query(`
+      SELECT
+        tc.TABLE_NAME                 AS table_name,
+        kcu.COLUMN_NAME                AS column_name,
+        rc_ku.TABLE_NAME               AS ref_table,
+        rc_ku.COLUMN_NAME              AS ref_column
+      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+      JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+        ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+      JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+        ON tc.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+      JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE rc_ku
+        ON rc.UNIQUE_CONSTRAINT_NAME = rc_ku.CONSTRAINT_NAME
+      WHERE tc.CONSTRAINT_TYPE = 'FOREIGN KEY';
+    `);
+
+    const uniqueRes = await pool.request().query(`
+      SELECT
+        tc.TABLE_NAME      AS table_name,
+        tc.CONSTRAINT_NAME AS constraint_name,
+        kcu.COLUMN_NAME    AS column_name
+      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+      JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+        ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+      WHERE tc.CONSTRAINT_TYPE IN ('UNIQUE', 'PRIMARY KEY');
+    `);
+
+    return buildSchema(columnsRes.recordset, fkRes.recordset, {
+      table: "table_name",
+      column: "column_name",
+      dataType: "data_type",
+      nullable: "is_nullable",
+      isPk: "is_primary_key",
+      fkColumn: "column_name",
+      fkRefTable: "ref_table",
+      fkRefColumn: "ref_column",
+      nullableTrueValue: "YES",
+    }, buildSingleColumnUniqueSets(uniqueRes.recordset, {
+      table: "table_name",
+      constraint: "constraint_name",
+      column: "column_name",
+    }));
+  } finally {
+    await pool.close();
+  }
+}
+
+
 // cover exactly one column — those are the ones that make a FK column
 // unique (and so the relationship one-to-one rather than one-to-many).
 // Multi-column constraints don't make any single column in them unique on
@@ -225,17 +293,11 @@ function buildSchema(columnRows, fkRows, keys, uniqueSingleColumnsByTable = new 
     }
     const table = tableMap.get(tableName);
     const isPk = row[keys.isPk] === true || row[keys.isPk] === 1;
-    const { bsonType, confident } = inferDefaultBsonType(row[keys.dataType]);
     table.columns.push({
       name: row[keys.column],
       dataType: row[keys.dataType],
       nullable: row[keys.nullable] === keys.nullableTrueValue,
       isPrimaryKey: isPk,
-      bsonType,
-      // False when dataType wasn't recognized and the "string" fallback was
-      // used -- lets the UI flag a guess instead of presenting it as if it
-      // were a confirmed mapping.
-      bsonTypeConfident: confident,
     });
     if (isPk) table.primaryKey.push(row[keys.column]);
   }
@@ -259,7 +321,16 @@ function buildSchema(columnRows, fkRows, keys, uniqueSingleColumnsByTable = new 
 async function introspect(dbType, connectionConfig) {
   if (dbType === "postgres") return introspectPostgres(connectionConfig);
   if (dbType === "mysql") return introspectMysql(connectionConfig);
-  throw new Error(`Unsupported dbType: ${dbType}. Use "postgres" or "mysql".`);
+  if (dbType === "mssql") return introspectMssql(connectionConfig);
+  // Roadmap, not yet implemented: Oracle and Snowflake need their own
+  // driver + a different information_schema/system-catalog dialect. Rather
+  // than fake support, we fail loudly so this doesn't look silently broken.
+  if (dbType === "oracle" || dbType === "snowflake") {
+    throw new Error(
+      `dbType "${dbType}" is on the roadmap but not implemented yet. Supported today: postgres, mysql, mssql.`
+    );
+  }
+  throw new Error(`Unsupported dbType: ${dbType}. Use "postgres", "mysql", or "mssql".`);
 }
 
 module.exports = { introspect };
