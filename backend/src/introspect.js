@@ -24,7 +24,14 @@
  *       // `synthetic` (added by the UI, never set by introspect() itself)
  *       // marks a relationship the user manually declared because no real
  *       // FK constraint exists in the source database for it.
- *       foreignKeys: [{ columns, refTable, refColumns, unique, synthetic }]
+ *       foreignKeys: [{ columns, refTable, refColumns, unique, synthetic }],
+ *       // `watermarkColumn` (added by the UI, never set by introspect()
+ *       // itself) names a column tracking last-modified time -- when set,
+ *       // the generated Glue script narrows Incremental/SCD2 reads to
+ *       // rows changed since the last run instead of reading everything.
+ *       // Absent/null (the default) means "always full read" for this
+ *       // table, unchanged from before this field existed.
+ *       watermarkColumn: null
  *     },
  *     ...
  *   ]

@@ -37,14 +37,23 @@ function castSelectLines(varName, table) {
   return `${varName} = ${varName}.select(\n    ${castExprs.join(",\n    ")}\n)`;
 }
 
-// SCD2 needs a few extra pyspark functions the other two modes don't --
-// only pulled in when SCD2 is actually selected, so Full/Incremental
-// scripts don't carry unused imports.
-const PYSPARK_FUNCTIONS_BY_MODE = {
-  full: "collect_list, struct, col",
-  incremental: "collect_list, struct, col",
-  scd2: "collect_list, struct, col, sha2, concat_ws, current_timestamp, lit, array_sort, expr",
-};
+// Sanitizes a table name into a valid Python identifier fragment -- same
+// rule toVar() already uses for its df_<table> variables, reused here for
+// the new watermark-related variable names (_last_wm_<table>, etc.).
+function sanitizeIdent(name) {
+  return name.replace(/[^a-zA-Z0-9_]/g, "_");
+}
+
+// SCD2 needs a few extra pyspark functions the other two modes don't, and
+// watermark filtering needs `max` regardless of mode -- only pulled in
+// when actually needed, so scripts that don't use a feature don't carry
+// its unused imports.
+function pysparkFunctionImports(loadMode, useWatermarks) {
+  const fns = ["collect_list", "struct", "col"];
+  if (loadMode === "scd2") fns.push("sha2", "concat_ws", "current_timestamp", "lit", "array_sort", "expr");
+  if (useWatermarks) fns.push("max");
+  return fns.join(", ");
+}
 
 // Appended to write_to_mongo's body only when SCD2 is selected -- compares
 // each incoming row's content hash against the collection's current
@@ -142,8 +151,68 @@ def _write_scd2(new_df, collection_name, business_key_cols):
     )
 `;
 
+// Appended to the script only when at least one table has a watermarkColumn
+// configured *and* loadMode isn't "full" (a full run always drops/rebuilds
+// every collection from scratch, so narrowing the read would just silently
+// lose unchanged rows -- watermarks are ignored outright in that mode).
+// Mirrors _write_scd2's _versionId lesson: keyed by a plain string (the
+// table name) rather than MongoDB's own _id, so there's no ObjectId
+// round-trip risk on the read-back.
+const WATERMARK_FUNCTIONS = `
+
+def _read_watermark(state_key):
+    state_df = (
+        spark.read.format("mongodb")
+        .option("connection.uri", MONGO_URI)
+        .option("database", MONGO_DATABASE)
+        .option("collection", "_migration_state")
+        .load()
+    )
+    if "_id" not in state_df.columns:
+        return None
+    row = state_df.filter(col("_id") == state_key).first()
+    return row["lastWatermark"] if row else None
+
+
+def _write_watermark(state_key, value):
+    if value is None:
+        return
+    (
+        spark.createDataFrame([(state_key, value)], ["_id", "lastWatermark"])
+        .write.format("mongodb")
+        .mode("append")
+        .option("idFieldList", "_id")
+        .option("connection.uri", MONGO_URI)
+        .option("database", MONGO_DATABASE)
+        .option("collection", "_migration_state")
+        .save()
+    )
+`;
+
+// True if narrowing reads by watermark is both configured (some table has a
+// watermarkColumn) and safe to apply (loadMode isn't "full" -- see
+// WATERMARK_FUNCTIONS's comment for why full ignores it outright).
+function shouldUseWatermarks(schema, loadMode) {
+  return loadMode !== "full" && schema.tables.some((t) => t.watermarkColumn);
+}
+
+// True if this specific collection's root table, or any of its embedded
+// children, has a watermarkColumn configured -- gates whether
+// generateCollectionBlock emits any watermark logic for it at all, so a
+// collection with no watermarked tables stays byte-identical to before this
+// feature existed.
+function collectionHasAnyWatermark(collection, tableByName) {
+  const rootTable = tableByName.get(collection.rootTable);
+  if (rootTable && rootTable.watermarkColumn) return true;
+  return collection.embeds.some((embed) => {
+    const childTable = tableByName.get(embed.table);
+    return childTable && childTable.watermarkColumn;
+  });
+}
+
 function generateGlueJob({ jdbc, mongo, schema, mapping, loadMode = "full" }) {
   const tableByName = new Map(schema.tables.map((t) => [t.name, t]));
+  const useWatermarks = shouldUseWatermarks(schema, loadMode);
 
   const header = `"""
 Auto-generated AWS Glue ETL job.
@@ -169,6 +238,13 @@ ${
       "efficiency gain here is fewer/no-op MongoDB writes when nothing changed,\n" +
       "not less reading from the source."
     : "Full: drops/truncates each target collection before writing (the MongoDB\nSpark Connector's default behavior for mode(\"overwrite\"))."
+}${
+  useWatermarks
+    ? "\n\nWatermark filtering: enabled for at least one table. Reads are narrowed\n" +
+      "to rows changed since the last successful run (tracked per-table in the\n" +
+      "_migration_state collection) instead of reading everything -- see each\n" +
+      "collection block below for which tables opted in."
+    : ""
 }
 """
 
@@ -178,7 +254,7 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql.functions import ${PYSPARK_FUNCTIONS_BY_MODE[loadMode] || PYSPARK_FUNCTIONS_BY_MODE.full}
+from pyspark.sql.functions import ${pysparkFunctionImports(loadMode, useWatermarks)}
 
 args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 sc = SparkContext()
@@ -229,10 +305,13 @@ def write_to_mongo(df, collection_name, id_field_list=None):
         return
     writer = df.write.format("mongodb")
     if LOAD_MODE == "incremental" and id_field_list:
-        # Upsert: replace a document matching id_field_list's value, insert
-        # if no match exists (operationType="replace"/upsertDocument=true
-        # are the MongoDB Spark Connector's own defaults -- not set here).
-        writer = writer.mode("append").option("idFieldList", id_field_list)
+        # Partial update ($set only the columns present in df) rather than
+        # the connector's default full-document replace -- preserves any
+        # field on the existing Mongo document that isn't part of this
+        # collection's mapped schema (hand-added, or written by another
+        # pipeline). upsertDocument stays at its default (true), so a row
+        # with no existing match is still inserted normally.
+        writer = writer.mode("append").option("operationType", "update").option("idFieldList", id_field_list)
     else:
         writer = writer.mode("overwrite")
     (
@@ -242,11 +321,11 @@ def write_to_mongo(df, collection_name, id_field_list=None):
         .option("collection", collection_name)
         .save()
     )
-${loadMode === "scd2" ? WRITE_SCD2_FUNCTION : ""}
+${loadMode === "scd2" ? WRITE_SCD2_FUNCTION : ""}${useWatermarks ? WATERMARK_FUNCTIONS : ""}
 `;
 
   const collectionBlocks = mapping.collections
-    .map((collection) => generateCollectionBlock(collection, tableByName, loadMode))
+    .map((collection) => generateCollectionBlock(collection, tableByName, loadMode, useWatermarks))
     .join("\n\n");
 
   const footer = `
@@ -257,7 +336,7 @@ job.commit()
   return header + collectionBlocks + footer;
 }
 
-function generateCollectionBlock(collection, tableByName, loadMode) {
+function generateCollectionBlock(collection, tableByName, loadMode, useWatermarks) {
   const rootVar = toVar(collection.rootTable);
   const rootTable = tableByName.get(collection.rootTable);
   const lines = [];
@@ -265,7 +344,78 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
   lines.push(`# ---------------------------------------------------------------------------`);
   lines.push(`# Collection: ${collection.collectionName}  (root table: ${collection.rootTable})`);
   lines.push(`# ---------------------------------------------------------------------------`);
+
+  // Tables (root and/or embed children) whose changed-since-last-run rows
+  // feed both the union that narrows the root read below, and the
+  // post-write watermark update at the end of this block. Empty when this
+  // collection has no watermarked tables at all -- in that case nothing
+  // below this point runs and generation is byte-identical to before this
+  // feature existed.
+  const watermarkedTables = [];
+  let keysToReprocessVar = null;
+
+  if (useWatermarks && collectionHasAnyWatermark(collection, tableByName)) {
+    const rootKeys = rootKeyCols(collection);
+    const unionParts = [];
+
+    if (rootTable && rootTable.watermarkColumn) {
+      const ident = sanitizeIdent(collection.rootTable);
+      const changedVar = `_changed_${ident}`;
+      const keysVar = `_changed_keys_${ident}`;
+      const keySelectExprs = rootKeys.map((k) => `col(${pythonStr(k)})`).join(", ");
+      lines.push("");
+      lines.push(`# Watermark: only reprocess "${collection.rootTable}" rows changed since the last run (first run has no stored watermark, so everything is read)`);
+      lines.push(`_last_wm_${ident} = _read_watermark(${pythonStr(collection.rootTable)})`);
+      lines.push(`${changedVar} = read_table(${pythonStr(collection.rootTable)})`);
+      lines.push(`if _last_wm_${ident} is not None:`);
+      lines.push(`    ${changedVar} = ${changedVar}.filter(col(${pythonStr(rootTable.watermarkColumn)}) >= _last_wm_${ident})`);
+      lines.push(`${keysVar} = ${changedVar}.select(${keySelectExprs})`);
+      unionParts.push(keysVar);
+      watermarkedTables.push({ tableName: collection.rootTable, changedVar, ident, watermarkColumn: rootTable.watermarkColumn });
+    }
+
+    for (const embed of collection.embeds) {
+      const childTable = tableByName.get(embed.table);
+      if (!childTable || !childTable.watermarkColumn) continue;
+
+      const ident = sanitizeIdent(embed.table);
+      const changedVar = `_changed_${ident}`;
+      const keysVar = `_changed_keys_${ident}`;
+      const fkCols = embed.foreignKey;
+      const pairCount = Math.min(rootKeys.length, fkCols.length);
+      // Alias the child's FK columns to the root's PK column names so this
+      // lines up with changed_root_keys in the union below -- same
+      // positional embed.foreignKey[i] <-> collection.primaryKey[i]
+      // correspondence already used for the embed join condition.
+      const aliasedKeySelectExprs = Array.from(
+        { length: pairCount },
+        (_, i) => `col(${pythonStr(fkCols[i])}).alias(${pythonStr(rootKeys[i])})`
+      ).join(", ");
+      lines.push("");
+      lines.push(`# Watermark: also reprocess "${collection.rootTable}" rows whose embedded "${embed.table}" child changed since its last run`);
+      lines.push(`_last_wm_${ident} = _read_watermark(${pythonStr(embed.table)})`);
+      lines.push(`${changedVar} = read_table(${pythonStr(embed.table)})`);
+      lines.push(`if _last_wm_${ident} is not None:`);
+      lines.push(`    ${changedVar} = ${changedVar}.filter(col(${pythonStr(childTable.watermarkColumn)}) >= _last_wm_${ident})`);
+      lines.push(`${keysVar} = ${changedVar}.select(${aliasedKeySelectExprs})`);
+      unionParts.push(keysVar);
+      watermarkedTables.push({ tableName: embed.table, changedVar, ident, watermarkColumn: childTable.watermarkColumn });
+    }
+
+    if (unionParts.length > 0) {
+      keysToReprocessVar = `_keys_to_reprocess_${sanitizeIdent(collection.rootTable)}`;
+      const unionExpr = unionParts.reduce((acc, part) => (acc ? `${acc}.union(${part})` : part), "");
+      lines.push("");
+      lines.push(`${keysToReprocessVar} = ${unionExpr}.distinct()`);
+    }
+  }
+
   lines.push(`${rootVar} = read_table(${pythonStr(collection.rootTable)})`);
+  if (keysToReprocessVar) {
+    const rootKeys = rootKeyCols(collection);
+    const keyList = rootKeys.map((k) => pythonStr(k)).join(", ");
+    lines.push(`${rootVar} = ${rootVar}.join(${keysToReprocessVar}, [${keyList}], "inner")`);
+  }
   if (rootTable) lines.push(castSelectLines(rootVar, rootTable));
 
   let currentVar = rootVar;
@@ -351,6 +501,19 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
     `write_to_mongo(${currentVar}, ${pythonStr(collection.collectionName)}, id_field_list=${pythonStr(idFieldListOf(collection.primaryKey))})`
   );
 
+  if (watermarkedTables.length > 0) {
+    lines.push("");
+    lines.push(`# Update stored watermarks now that this run succeeded. New watermark is`);
+    lines.push(`# MAX(watermarkColumn) over each table's own changed-since-last-run rows --`);
+    lines.push(`# on the first run (no stored watermark) that's every row; on later runs`);
+    lines.push(`# nothing outside that set could exceed the previous max anyway, assuming`);
+    lines.push(`# the watermark column only increases.`);
+    for (const wt of watermarkedTables) {
+      lines.push(`_new_wm_${wt.ident} = ${wt.changedVar}.agg(max(col(${pythonStr(wt.watermarkColumn)}))).collect()[0][0]`);
+      lines.push(`_write_watermark(${pythonStr(wt.tableName)}, _new_wm_${wt.ident})`);
+    }
+  }
+
   // References: written to their own collection, keeping only the FK
   // (no embedding) so they can be looked up independently at read time.
   for (const ref of collection.references) {
@@ -358,13 +521,26 @@ function generateCollectionBlock(collection, tableByName, loadMode) {
     if (!refTable) continue;
 
     const refVar = toVar(ref.table);
+    const refIdent = sanitizeIdent(ref.table);
+    const refHasWatermark = useWatermarks && refTable.watermarkColumn;
     lines.push("");
     lines.push(`# Reference "${ref.table}" -> kept as its own collection, linked by "${ref.foreignKey.join(", ")}"`);
-    lines.push(`${refVar} = read_table(${pythonStr(ref.table)})`);
+    if (refHasWatermark) {
+      lines.push(`_last_wm_${refIdent} = _read_watermark(${pythonStr(ref.table)})`);
+      lines.push(`${refVar} = read_table(${pythonStr(ref.table)})`);
+      lines.push(`if _last_wm_${refIdent} is not None:`);
+      lines.push(`    ${refVar} = ${refVar}.filter(col(${pythonStr(refTable.watermarkColumn)}) >= _last_wm_${refIdent})`);
+    } else {
+      lines.push(`${refVar} = read_table(${pythonStr(ref.table)})`);
+    }
     lines.push(castSelectLines(refVar, refTable));
     lines.push(
       `write_to_mongo(${refVar}, ${pythonStr(pluralizeForVar(ref.table))}, id_field_list=${pythonStr(idFieldListOf(refTable.primaryKey))})`
     );
+    if (refHasWatermark) {
+      lines.push(`_new_wm_${refIdent} = ${refVar}.agg(max(col(${pythonStr(refTable.watermarkColumn)}))).collect()[0][0]`);
+      lines.push(`_write_watermark(${pythonStr(ref.table)}, _new_wm_${refIdent})`);
+    }
   }
 
   return lines.join("\n");

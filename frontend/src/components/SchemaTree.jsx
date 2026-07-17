@@ -14,6 +14,7 @@ export default function SchemaTree({
   onAddForeignKey,
   onRemoveForeignKey,
   onChangeColumnBsonType,
+  onSetWatermarkColumn,
   onContinue,
 }) {
   // "list" is the interactive editor (BSON types, synthetic FKs); "diagram"
@@ -148,6 +149,24 @@ export default function SchemaTree({
           <span style={{ color: "var(--muted)" }}>
             ({table.primaryKey.join(", ") || "no PK"})
           </span>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+            <label style={{ margin: 0, color: "var(--muted)", fontSize: 12 }}>
+              Watermark column (optional)
+            </label>
+            <select
+              value={table.watermarkColumn || ""}
+              onChange={(e) => onSetWatermarkColumn(table.name, e.target.value)}
+              title="A last-modified timestamp column -- when set, Incremental/SCD2 narrow reads to rows changed since the last run instead of reading everything"
+            >
+              <option value="">none (always full read)</option>
+              {table.columns.map((c) => (
+                <option key={c.name} value={c.name}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </div>
 
           <div className="cols" style={{ marginTop: 6 }}>
             {table.columns.map((c) => (

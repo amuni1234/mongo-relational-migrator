@@ -301,16 +301,20 @@ The downloaded `.py` script assumes:
     re-runs.
   - **Incremental** — `mode("append")` + the MongoDB Spark Connector's
     `idFieldList` option set to each collection's primary key, so re-runs
-    upsert (replace-if-matched, insert-if-not) instead of wiping the
-    collection first. `operationType`/`upsertDocument` are left at the
-    connector's own defaults (`replace`/`true`), which already implement
-    this — no need to set them explicitly. **Two things incremental does
-    NOT do**: it doesn't delete target documents whose source row was
+    upsert (update-if-matched, insert-if-not) instead of wiping the
+    collection first. `operationType` is explicitly set to `"update"`
+    (`upsertDocument` stays at its default, `true`) rather than the
+    connector's own default of `"replace"` — `update` performs a partial
+    `$set` of just the columns in the mapped schema, so any field on an
+    existing document that isn't part of this collection's mapping (hand-
+    added directly in Mongo, or written by a separate pipeline) survives a
+    re-run instead of being wiped by a full-document replace (confirmed by
+    testing both ways). **Two things incremental does NOT do**: it doesn't
+    delete target documents whose source row was
     deleted (a row removed from Postgres/MySQL leaves its Mongo document
-    behind), and it doesn't reduce how much is read from the source — every
-    run still reads the full table via JDBC. A true incremental *extract*
-    (only reading changed rows via a watermark column) is a separate,
-    larger roadmap item.
+    behind), and — unless a watermark column is configured (see
+    "Watermark-based incremental extract" below) — it doesn't reduce how
+    much is read from the source; every run reads the full table via JDBC.
   - **Incremental (SCD2)** — preserves history instead of replacing in
     place. Each incoming row gets a content hash (covering every real
     column); rows whose hash matches the collection's current
@@ -337,11 +341,66 @@ The downloaded `.py` script assumes:
     child's own primary key placed first in the struct, so plain
     single-argument `array_sort` — the only form Spark 3.3/Glue 4.0
     supports — sorts by it) to keep hashes stable. Like Incremental, SCD2
-    still reads the full source table every run; the efficiency gain here
-    is fewer/no-op MongoDB writes, not less reading from the source.
+    reads the full source table every run unless a watermark column is
+    configured; the efficiency gain from SCD2 itself is fewer/no-op MongoDB
+    writes, which is a separate concern from how much gets read.
 
 Upload the script as the job's script location, set the `--JOB_NAME` job
 parameter (Glue does this automatically), and run.
+
+### Watermark-based incremental extract
+
+An optional, orthogonal add-on to Incremental/SCD2 (ignored outright in
+Full mode, which always drops/rebuilds every collection from scratch —
+narrowing its read would just silently lose unchanged rows). Set a
+**watermark column** — a last-modified timestamp — per table via the new
+dropdown next to each table in the Schema step's List view. Leaving it as
+"none" (the default) means that table is always read in full, exactly as
+before this feature existed; a table with no watermark column configured
+produces byte-identical generated code to what came out before this was
+added.
+
+When configured, the generated script tracks the last-processed watermark
+per table in a small MongoDB collection, `_migration_state`
+(`{_id: "<table name>", lastWatermark: ...}`), and narrows reads instead of
+always reading everything:
+
+- **Root table only** (no embeds, or none of them have a watermark
+  configured): the root read is filtered to `watermarkColumn >=
+  last_watermark` directly, and only that changed subset is written.
+- **Root + embeds**: filtering only the root's own read isn't correct on
+  its own — a row whose *embedded child* changed, with the parent row
+  itself untouched, would be silently skipped, producing a stale nested
+  document forever. So instead: rows changed in the root **and** rows
+  changed in any watermark-configured embedded child (child FK columns
+  mapped positionally onto the root's primary key — the exact
+  `embed.foreignKey[i]` ↔ `collection.primaryKey[i]` correspondence
+  composite keys already use for the embed join) are unioned into a
+  `keys_to_reprocess` set. The root is then read in full and narrowed via
+  an inner join against that key set, so every parent whose *own* row or
+  *any* embedded child changed gets its full current document rebuilt —
+  the same "child changed, parent didn't" case that motivated building
+  SCD2 in the first place, now handled on the read side too. Embedded
+  child tables themselves are still read in full each run (only the root
+  narrows) — a further refinement, not core to this round.
+- **Reference tables**: filtered independently and directly by their own
+  watermark column, if configured — there's no embed/union complexity
+  since a reference isn't joined into anything else.
+- **First run** (no stored watermark yet): every filter is skipped, so it
+  reads and writes everything and seeds `_migration_state`, then narrows
+  on every subsequent run.
+- **Composite keys**: nothing new to build here — the union and the
+  narrowing join both operate on `collection.primaryKey`/
+  `embed.foreignKey` as complete column arrays, reusing the same
+  multi-column join pattern already built for the embed join and for
+  SCD2's `business_key_cols`.
+
+This still doesn't detect **deletes** — a source row disappearing has no
+timestamp to be caught by, same limitation as plain Incremental. As with
+SCD2, nothing here enforces a business-key uniqueness constraint at the
+database level; a compound unique index (e.g.
+`db.customers.createIndex({id: 1}, {unique: true})`, or the composite
+equivalent) on each collection's business key is recommended.
 
 ### Real AWS run — architecture and rough cost
 
@@ -416,10 +475,12 @@ Five larger items, in rough build order (smallest/most contained first):
    load-mode toggle in the Glue-job step generates the original
    `mode("overwrite")` script, an upsert-by-primary-key variant
    (`mode("append")` + `idFieldList`), or a Slowly Changing Dimension Type 2
-   (SCD2) variant that preserves history instead of replacing in place.
-   None of the three reduce read volume via a watermark column yet — see
-   the "Load mode" bullet under "Using the generated Glue job" above for
-   the exact tradeoffs of each.
+   (SCD2) variant that preserves history instead of replacing in place. An
+   optional per-table watermark column additionally narrows what
+   Incremental/SCD2 read and write to just rows changed since the last run
+   — see "Watermark-based incremental extract" under "Using the generated
+   Glue job" above for the exact tradeoffs and the embed/composite-key
+   handling.
 3. **Additional relational sources** — beyond Postgres/MySQL (e.g. SQL
    Server, Oracle). Each new engine needs its own `information_schema`-
    equivalent introspection queries and JDBC driver wired into the
@@ -439,8 +500,8 @@ Five larger items, in rough build order (smallest/most contained first):
 
 - Glue-only — no EMR/Dataproc generator yet
 - Neither Incremental nor SCD2 delete a target document whose source row was
-  deleted, and neither reduces read volume (no watermark-based incremental
-  extract yet — every run still reads the full source table via JDBC)
+  deleted — a watermark column has no way to notice a row's absence, only
+  its change (same gap the separate anti-join/CDC discussion covers)
 - MongoDB's own `_id` (a BSON ObjectId) doesn't round-trip cleanly through
   the Spark Connector — reading it back gives a bare hex string with no
   type marker, and writing that string back doesn't get reinterpreted as

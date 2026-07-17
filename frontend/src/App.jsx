@@ -88,6 +88,17 @@ export default function App() {
     }));
   }
 
+  // `null` means "no watermark, always full read for this table" -- the
+  // default, so nothing changes unless a user deliberately opts in.
+  function setTableWatermarkColumn(tableName, columnName) {
+    setSchema((prev) => ({
+      ...prev,
+      tables: prev.tables.map((t) =>
+        t.name === tableName ? { ...t, watermarkColumn: columnName || null } : t
+      ),
+    }));
+  }
+
   function toggleTableSelection(tableName) {
     setSelectedTableNames((prev) => {
       const next = new Set(prev);
@@ -187,6 +198,7 @@ export default function App() {
           onAddForeignKey={addSyntheticForeignKey}
           onRemoveForeignKey={removeSyntheticForeignKey}
           onChangeColumnBsonType={setColumnBsonType}
+          onSetWatermarkColumn={setTableWatermarkColumn}
           onContinue={() => setStep("mapping")}
         />
       )}

@@ -250,7 +250,8 @@
           "name": { "type": "string" },
           "columns": { "type": "array", "items": { "$ref": "#/components/schemas/Column" } },
           "primaryKey": { "type": "array", "items": { "type": "string" } },
-          "foreignKeys": { "type": "array", "items": { "$ref": "#/components/schemas/ForeignKey" } }
+          "foreignKeys": { "type": "array", "items": { "$ref": "#/components/schemas/ForeignKey" } },
+          "watermarkColumn": { "type": "string", "nullable": true, "description": "A last-modified timestamp column, set by the user in the Schema step. When set, the generated Glue job (Incremental/SCD2 only -- ignored in Full mode) narrows reads to rows changed since the last successful run instead of reading everything, tracking per-table progress in a MongoDB _migration_state collection. Absent/null (the default) means always full read for this table." }
         }
       },
       "Schema": {
