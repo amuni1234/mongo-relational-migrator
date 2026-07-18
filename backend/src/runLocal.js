@@ -63,6 +63,27 @@ function runPythonScript(scriptPath, args) {
   });
 }
 
+// Spark's shutdown-hook cleanup (stopping the context, deleting temp dirs)
+// logs a lot of INFO noise *after* the actual failure, so a plain "last N
+// characters" tail on a failed run usually shows none of the real error.
+// Prefer a window around the last Python traceback (or the last line
+// mentioning an Exception, for JVM-side failures with no Python traceback)
+// when one exists; fall back to the raw tail otherwise.
+function extractRelevantLog(log, tailChars = 4000) {
+  const tracebackMatches = [...log.matchAll(/Traceback \(most recent call last\):/g)];
+  if (tracebackMatches.length > 0) {
+    const start = tracebackMatches[tracebackMatches.length - 1].index;
+    return log.slice(start, start + tailChars);
+  }
+  const exceptionLines = [...log.matchAll(/^.*(Exception|Error)[:\s].*$/gm)];
+  if (exceptionLines.length > 0) {
+    const last = exceptionLines[exceptionLines.length - 1];
+    const start = Math.max(0, last.index - 500);
+    return log.slice(start, start + tailChars);
+  }
+  return log.slice(-tailChars);
+}
+
 function runDocker(args) {
   return new Promise((resolve, reject) => {
     execFile(
@@ -77,15 +98,32 @@ function runDocker(args) {
           // of reporting a bogus job failure.
           const infraFailure = err.code === "ENOENT" || /Cannot connect to the Docker daemon/.test(log);
           if (infraFailure) return reject(new Error(log.trim() || err.message));
-          return resolve({ success: false, log });
+          return resolve({ success: false, log: extractRelevantLog(log) });
         }
-        resolve({ success: true, log });
+        resolve({ success: true, log: log.slice(-4000) });
       }
     );
   });
 }
 
+// The "Generate"/"Download" fields are meant to be edited before a real
+// deploy, so their defaults are deliberately placeholder-looking
+// (mongodb+srv://<cluster-uri>, prod/jdbc/password, etc.) -- fine for that
+// flow, but running this fast-and-local would otherwise burn a minute on a
+// Docker run that Spark rejects anyway with a JVM exception. Catch the
+// obvious case (a URI containing angle brackets) up front instead.
+function assertNotPlaceholder(label, value) {
+  if (/[<>]/.test(value)) {
+    throw new Error(
+      `${label} still looks like a placeholder ("${value}") -- set it to a real, reachable value before running locally.`
+    );
+  }
+}
+
 async function runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine }) {
+  assertNotPlaceholder("MongoDB connection URI", mongo.uri);
+  assertNotPlaceholder("JDBC URL", jdbc.url);
+
   const localJdbc = { ...jdbc, url: rewriteHostForDocker(jdbc.url) };
   const localMongo = { ...mongo, uri: rewriteHostForDocker(mongo.uri) };
   const script = generateGlueJob({ jdbc: localJdbc, mongo: localMongo, schema, mapping, loadMode });

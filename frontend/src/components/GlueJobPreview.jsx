@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { api } from "../api";
 
 const DRIVER_BY_TYPE = {
   postgres: "org.postgresql.Driver",
@@ -32,6 +33,26 @@ export default function GlueJobPreview({
   const [mongoDb, setMongoDb] = useState("migrated_db");
   const [loadMode, setLoadMode] = useState("full");
   const [engine, setEngine] = useState("glue");
+
+  // Same prefill TestLoadPanel.jsx already does from the backend's own
+  // .env -- the mongodb+srv://<cluster-uri> default is meant to be edited
+  // before a real deploy, but is also a literal placeholder that crashes
+  // "Run locally now" outright (Spark rejects it as an invalid SRV host)
+  // if nobody happens to replace it first. Only overrides while the field
+  // is still at its hardcoded default -- won't clobber anything typed in.
+  useEffect(() => {
+    api
+      .mongoDefaults()
+      .then(({ uri: defaultUri, database: defaultDatabase }) => {
+        if (defaultUri) {
+          setMongoUri((current) => (current === "mongodb+srv://<cluster-uri>" ? defaultUri : current));
+        }
+        if (defaultDatabase) {
+          setMongoDb((current) => (current === "migrated_db" ? defaultDatabase : current));
+        }
+      })
+      .catch(() => {}); // no .env defaults configured -- keep the hardcoded fallback
+  }, []);
 
   function buildJdbcUrl() {
     if (dbType === "postgres") {
@@ -195,8 +216,7 @@ export default function GlueJobPreview({
 
             {runError && (
               <div className="error-banner" style={{ marginTop: 12 }}>
-                Couldn't run it at all (Docker unavailable, or the run infrastructure
-                failed): {runError}
+                Couldn't run it at all: {runError}
               </div>
             )}
 
