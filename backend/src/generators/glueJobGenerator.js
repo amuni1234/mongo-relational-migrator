@@ -198,6 +198,15 @@ def _write_scd2(new_df, collection_name, business_key_cols, exclude_from_hash_co
 // round-trip risk on the read-back.
 const WATERMARK_FUNCTIONS = `
 
+def _sql_literal(value):
+    # str() on a datetime already gives "YYYY-MM-DD HH:MM:SS[.ffffff]",
+    # a literal both Postgres and MySQL accept for a timestamp comparison.
+    # Quote-escaped defensively even though a watermark value (something we
+    # wrote ourselves via _write_watermark, read back from our own
+    # _migration_state collection) is never expected to contain one.
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _read_watermark(state_key):
     state_df = (
         spark.read.format("mongodb")
@@ -344,11 +353,17 @@ _secret_value = _secrets.get_secret_value(SecretId=JDBC_PASSWORD_SECRET_NAME)
 JDBC_PASSWORD = _json.loads(_secret_value["SecretString"]).get("password")
 
 
-def read_table(table_name):
+def read_table(table_name, where=None):
+    # "where", when given, is pushed down as a real SQL predicate in the
+    # dbtable subquery -- the source database itself narrows what's sent
+    # over JDBC, rather than Spark pulling every row and filtering after
+    # the fact. Used by the watermark feature below; every other call site
+    # passes nothing and behaves exactly as before.
+    dbtable = f"(SELECT * FROM {table_name} WHERE {where}) AS _pushdown" if where else table_name
     return (
         spark.read.format("jdbc")
         .option("url", JDBC_URL)
-        .option("dbtable", table_name)
+        .option("dbtable", dbtable)
         .option("user", JDBC_USER)
         .option("password", JDBC_PASSWORD)
         .option("driver", JDBC_DRIVER)
@@ -421,11 +436,10 @@ function generateCollectionBlock(collection, tableByName, loadMode, useWatermark
       const keysVar = `_changed_keys_${ident}`;
       const keySelectExprs = rootKeys.map((k) => `col(${pythonStr(k)})`).join(", ");
       lines.push("");
-      lines.push(`# Watermark: only reprocess "${collection.rootTable}" rows changed since the last run (first run has no stored watermark, so everything is read)`);
+      lines.push(`# Watermark: only reprocess "${collection.rootTable}" rows changed since the last run (first run has no stored watermark, so everything is read). Pushed down as a real SQL predicate -- the source database narrows this before it ever reaches Spark.`);
       lines.push(`_last_wm_${ident} = _read_watermark(${pythonStr(collection.rootTable)})`);
-      lines.push(`${changedVar} = read_table(${pythonStr(collection.rootTable)})`);
-      lines.push(`if _last_wm_${ident} is not None:`);
-      lines.push(`    ${changedVar} = ${changedVar}.filter(col(${pythonStr(rootTable.watermarkColumn)}) >= _last_wm_${ident})`);
+      lines.push(`_where_${ident} = f"${rootTable.watermarkColumn} >= {_sql_literal(_last_wm_${ident})}" if _last_wm_${ident} is not None else None`);
+      lines.push(`${changedVar} = read_table(${pythonStr(collection.rootTable)}, where=_where_${ident})`);
       lines.push(`${keysVar} = ${changedVar}.select(${keySelectExprs})`);
       unionParts.push(keysVar);
       watermarkedTables.push({ tableName: collection.rootTable, changedVar, ident, watermarkColumn: rootTable.watermarkColumn });
@@ -449,11 +463,10 @@ function generateCollectionBlock(collection, tableByName, loadMode, useWatermark
         (_, i) => `col(${pythonStr(fkCols[i])}).alias(${pythonStr(rootKeys[i])})`
       ).join(", ");
       lines.push("");
-      lines.push(`# Watermark: also reprocess "${collection.rootTable}" rows whose embedded "${embed.table}" child changed since its last run`);
+      lines.push(`# Watermark: also reprocess "${collection.rootTable}" rows whose embedded "${embed.table}" child changed since its last run. Pushed down as a real SQL predicate, same as the root's own check above.`);
       lines.push(`_last_wm_${ident} = _read_watermark(${pythonStr(embed.table)})`);
-      lines.push(`${changedVar} = read_table(${pythonStr(embed.table)})`);
-      lines.push(`if _last_wm_${ident} is not None:`);
-      lines.push(`    ${changedVar} = ${changedVar}.filter(col(${pythonStr(childTable.watermarkColumn)}) >= _last_wm_${ident})`);
+      lines.push(`_where_${ident} = f"${childTable.watermarkColumn} >= {_sql_literal(_last_wm_${ident})}" if _last_wm_${ident} is not None else None`);
+      lines.push(`${changedVar} = read_table(${pythonStr(embed.table)}, where=_where_${ident})`);
       lines.push(`${keysVar} = ${changedVar}.select(${aliasedKeySelectExprs})`);
       unionParts.push(keysVar);
       watermarkedTables.push({ tableName: embed.table, changedVar, ident, watermarkColumn: childTable.watermarkColumn });
@@ -593,9 +606,8 @@ function generateCollectionBlock(collection, tableByName, loadMode, useWatermark
     lines.push(`# Reference "${ref.table}" -> kept as its own collection, linked by "${ref.foreignKey.join(", ")}"`);
     if (refHasWatermark) {
       lines.push(`_last_wm_${refIdent} = _read_watermark(${pythonStr(ref.table)})`);
-      lines.push(`${refVar} = read_table(${pythonStr(ref.table)})`);
-      lines.push(`if _last_wm_${refIdent} is not None:`);
-      lines.push(`    ${refVar} = ${refVar}.filter(col(${pythonStr(refTable.watermarkColumn)}) >= _last_wm_${refIdent})`);
+      lines.push(`_where_${refIdent} = f"${refTable.watermarkColumn} >= {_sql_literal(_last_wm_${refIdent})}" if _last_wm_${refIdent} is not None else None`);
+      lines.push(`${refVar} = read_table(${pythonStr(ref.table)}, where=_where_${refIdent})`);
     } else {
       lines.push(`${refVar} = read_table(${pythonStr(ref.table)})`);
     }

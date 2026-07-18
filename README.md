@@ -450,6 +450,20 @@ always reading everything:
 - **Reference tables**: filtered independently and directly by their own
   watermark column, if configured — there's no embed/union complexity
   since a reference isn't joined into anything else.
+- **The watermark comparison itself is pushed down as a real SQL
+  predicate**, not applied client-side after a full read: `read_table()`
+  takes an optional `where` argument, and when a watermark filter applies,
+  it's passed as a `dbtable` subquery — `(SELECT * FROM t WHERE col >=
+  '...') AS _pushdown` — so the source database narrows what it sends over
+  JDBC, rather than Spark pulling every row and filtering in memory
+  afterward. Confirmed with Postgres's own query log during testing: the
+  predicate genuinely arrives as part of the SQL text the database
+  executes. This applies to every table's own changed-row detection (root,
+  embedded children, references) — the one exception is the root's final
+  *narrowed-by-`keys_to_reprocess`* read in the embed case, which stays a
+  plain full read joined in Spark, since narrowing by a dynamic (and
+  possibly composite-key) set of specific keys doesn't have as clean or
+  safe a SQL-pushdown story as a simple threshold comparison.
 - **First run** (no stored watermark yet): every filter is skipped, so it
   reads and writes everything and seeds `_migration_state`, then narrows
   on every subsequent run.
