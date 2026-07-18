@@ -5,6 +5,8 @@ const { generateGlueJob } = require("../generators/glueJobGenerator");
 const { testLoad } = require("../mongoLoader");
 const { validateComputedExpression } = require("../validateComputedExpression");
 const { runLocal } = require("../runLocal");
+const { estimateDataSize } = require("../estimateDataSize");
+const { suggestSparkConfig } = require("../sparkConfigSuggester");
 
 const router = express.Router();
 
@@ -58,18 +60,19 @@ router.post("/suggest-mapping", (req, res) => {
 
 /**
  * POST /api/generate-glue-job
- * body: { jdbc: {...}, mongo: {...}, schema: {...}, mapping: {...}, loadMode?: "full" | "incremental" }
+ * body: { jdbc: {...}, mongo: {...}, schema: {...}, mapping: {...}, loadMode?: "full" | "incremental",
+ *         perf?: {driverMemory, executorMemory, executorCores, executorInstances, glueWorkerType?, glueNumberOfWorkers?} }
  * -> { script: "<python source>" }
  */
 router.post("/generate-glue-job", (req, res) => {
   try {
-    const { jdbc, mongo, schema, mapping, loadMode } = req.body;
+    const { jdbc, mongo, schema, mapping, loadMode, perf } = req.body;
     if (!jdbc || !mongo || !schema || !mapping) {
       return res
         .status(400)
         .json({ error: "jdbc, mongo, schema, and mapping are all required" });
     }
-    const script = generateGlueJob({ jdbc, mongo, schema, mapping, loadMode });
+    const script = generateGlueJob({ jdbc, mongo, schema, mapping, loadMode, perf });
     res.json({ script });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -126,7 +129,8 @@ router.post("/validate-computed-expression", async (req, res) => {
 /**
  * POST /api/run-local
  * body: { dbType, jdbc: {...}, mongo: {...}, schema: {...}, mapping: {...},
- *         loadMode?, engine: "glue" | "emr-serverless" | "emr-eks" }
+ *         loadMode?, engine: "glue" | "emr-serverless" | "emr-eks",
+ *         perf?: {driverMemory, executorMemory, executorCores, executorInstances} }
  * -> { engine, success, log }
  *
  * One-click version of the manual scripts/test-local-glue.sh workflow --
@@ -142,14 +146,42 @@ router.post("/validate-computed-expression", async (req, res) => {
  */
 router.post("/run-local", async (req, res) => {
   try {
-    const { dbType, jdbc, mongo, schema, mapping, loadMode, engine } = req.body;
+    const { dbType, jdbc, mongo, schema, mapping, loadMode, engine, perf } = req.body;
     if (!dbType || !jdbc || !mongo || !schema || !mapping || !engine) {
       return res
         .status(400)
         .json({ error: "dbType, jdbc, mongo, schema, mapping, and engine are all required" });
     }
-    const result = await runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine });
+    const result = await runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine, perf });
     res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/estimate-size
+ * body: { dbType, connection: {...driver config}, tableNames: [...] }
+ * -> { tables: [{name, rowEstimate, sizeBytes}], totalSizeBytes,
+ *      totalRowEstimate, suggested: {driverMemory, executorMemory,
+ *      executorCores, executorInstances, glueWorkerType,
+ *      glueNumberOfWorkers, bracket} }
+ *
+ * Cheap real queries against the source DB (pg_class / information_schema),
+ * with a bounded COUNT(*) fallback only for tables with no usable free
+ * estimate -- see estimateDataSize.js. Used to pre-fill the Glue-job step's
+ * "Performance settings", always manually overridable from there.
+ */
+router.post("/estimate-size", async (req, res) => {
+  try {
+    const { dbType, connection, tableNames } = req.body;
+    if (!dbType || !connection || !Array.isArray(tableNames) || tableNames.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "dbType, connection, and a non-empty tableNames[] are all required" });
+    }
+    const size = await estimateDataSize(dbType, connection, tableNames);
+    res.json({ ...size, suggested: suggestSparkConfig(size.totalSizeBytes) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

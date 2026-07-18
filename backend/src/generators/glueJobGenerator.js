@@ -275,7 +275,7 @@ function rootComputedColumnNames(collection, tableByName) {
   return rootTable.columns.filter((c) => c.computed).map((c) => c.name);
 }
 
-function generateGlueJob({ jdbc, mongo, schema, mapping, loadMode = "full" }) {
+function generateGlueJob({ jdbc, mongo, schema, mapping, loadMode = "full", perf }) {
   const tableByName = new Map(schema.tables.map((t) => [t.name, t]));
   const useWatermarks = shouldUseWatermarks(schema, loadMode);
   const useComputedColumns = schemaHasComputedColumns(schema);
@@ -310,6 +310,18 @@ ${
       "to rows changed since the last successful run (tracked per-table in the\n" +
       "_migration_state collection) instead of reading everything -- see each\n" +
       "collection block below for which tables opted in."
+    : ""
+}${
+  perf
+    ? "\n\nSuggested runtime sizing (informational only -- nothing below sets these,\n" +
+      "they're a starting point to configure yourself, not a scientific sizing\n" +
+      "model):\n" +
+      `  Spark config (EMR Serverless/EKS -- pass as spark-submit flags):\n` +
+      `    --driver-memory ${perf.driverMemory} --executor-memory ${perf.executorMemory} ` +
+      `--executor-cores ${perf.executorCores} --conf spark.executor.instances=${perf.executorInstances}\n` +
+      `  AWS Glue (a job-level setting, configured via the Console/API when the\n` +
+      `  job resource is created -- this script has no effect on it):\n` +
+      `    WorkerType=${perf.glueWorkerType}, NumberOfWorkers=${perf.glueNumberOfWorkers}`
     : ""
 }
 """

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api } from "../api";
 
 const DRIVER_BY_TYPE = {
@@ -15,6 +15,7 @@ const ENGINE_LABELS = {
 export default function GlueJobPreview({
   dbType,
   connection,
+  workingSchema,
   onGenerate,
   script,
   loading,
@@ -29,30 +30,35 @@ export default function GlueJobPreview({
   const [jdbcDb, setJdbcDb] = useState(connection?.database || "");
   const [jdbcUser, setJdbcUser] = useState(connection?.user || "");
   const [secretName, setSecretName] = useState("prod/jdbc/password");
-  const [mongoUri, setMongoUri] = useState("mongodb+srv://<cluster-uri>");
-  const [mongoDb, setMongoDb] = useState("migrated_db");
+  // Defaults to the local Docker Mongo container (what "Run locally now"
+  // actually needs to hit, zero cost) rather than a real Atlas cluster --
+  // deliberately NOT prefilled from the backend's own .env the way
+  // TestLoadPanel.jsx does, since that .env is a real remote Atlas cluster
+  // (used for the separate "Test Load" step's own purpose) and pointing
+  // "Run locally now" at a real cluster surfaces a real TLS/SNI
+  // compatibility issue between the Glue container's bundled JDK and
+  // Atlas, confirmed live -- unrelated to, and unfixable via, anything
+  // this tool controls. Still just a starting point for the "Generate/
+  // Download" flow too -- edit before a real deploy, same as before.
+  const [mongoUri, setMongoUri] = useState("mongodb://localhost:27017");
+  const [mongoDb, setMongoDb] = useState("migrator_test");
   const [loadMode, setLoadMode] = useState("full");
   const [engine, setEngine] = useState("glue");
 
-  // Same prefill TestLoadPanel.jsx already does from the backend's own
-  // .env -- the mongodb+srv://<cluster-uri> default is meant to be edited
-  // before a real deploy, but is also a literal placeholder that crashes
-  // "Run locally now" outright (Spark rejects it as an invalid SRV host)
-  // if nobody happens to replace it first. Only overrides while the field
-  // is still at its hardcoded default -- won't clobber anything typed in.
-  useEffect(() => {
-    api
-      .mongoDefaults()
-      .then(({ uri: defaultUri, database: defaultDatabase }) => {
-        if (defaultUri) {
-          setMongoUri((current) => (current === "mongodb+srv://<cluster-uri>" ? defaultUri : current));
-        }
-        if (defaultDatabase) {
-          setMongoDb((current) => (current === "migrated_db" ? defaultDatabase : current));
-        }
-      })
-      .catch(() => {}); // no .env defaults configured -- keep the hardcoded fallback
-  }, []);
+  // Performance settings: pre-filled by "Suggest based on data size" (a
+  // real query against the source DB, see estimateDataSize.js), always
+  // manually editable afterward. null fields mean "not set yet" -- the
+  // backend/generator simply omit perf entirely until a suggestion (or a
+  // manual edit) actually populates them.
+  const [driverMemory, setDriverMemory] = useState("");
+  const [executorMemory, setExecutorMemory] = useState("");
+  const [executorCores, setExecutorCores] = useState("");
+  const [executorInstances, setExecutorInstances] = useState("");
+  const [glueWorkerType, setGlueWorkerType] = useState("");
+  const [glueNumberOfWorkers, setGlueNumberOfWorkers] = useState("");
+  const [sizeHint, setSizeHint] = useState(null);
+  const [estimating, setEstimating] = useState(false);
+  const [estimateError, setEstimateError] = useState(null);
 
   function buildJdbcUrl() {
     if (dbType === "postgres") {
@@ -76,12 +82,52 @@ export default function GlueJobPreview({
     };
   }
 
+  // Only included once all four fields are actually set (either by a
+  // suggestion or by hand) -- omitting `perf` entirely is what keeps
+  // generateGlueJob()'s output byte-identical to before this feature
+  // existed for anyone who hasn't touched these fields.
+  function buildPerf() {
+    if (!driverMemory || !executorMemory || !executorCores || !executorInstances) return undefined;
+    return {
+      driverMemory,
+      executorMemory,
+      executorCores,
+      executorInstances,
+      glueWorkerType: glueWorkerType || undefined,
+      glueNumberOfWorkers: glueNumberOfWorkers || undefined,
+    };
+  }
+
+  async function handleSuggestSize() {
+    setEstimateError(null);
+    setEstimating(true);
+    try {
+      const tableNames = (workingSchema?.tables || []).map((t) => t.name);
+      const result = await api.estimateSize({ dbType, connection, tableNames });
+      setDriverMemory(result.suggested.driverMemory);
+      setExecutorMemory(result.suggested.executorMemory);
+      setExecutorCores(result.suggested.executorCores);
+      setExecutorInstances(result.suggested.executorInstances);
+      setGlueWorkerType(result.suggested.glueWorkerType);
+      setGlueNumberOfWorkers(String(result.suggested.glueNumberOfWorkers));
+      setSizeHint(
+        `~${(result.totalSizeBytes / (1024 * 1024)).toFixed(1)} MB across ${result.tables.length} table${
+          result.tables.length === 1 ? "" : "s"
+        } (~${result.totalRowEstimate.toLocaleString()} rows) -- ${result.suggested.bracket} bracket`
+      );
+    } catch (err) {
+      setEstimateError(err.message);
+    } finally {
+      setEstimating(false);
+    }
+  }
+
   function handleGenerate() {
-    onGenerate({ ...buildJdbcAndMongo(), loadMode });
+    onGenerate({ ...buildJdbcAndMongo(), loadMode, perf: buildPerf() });
   }
 
   function handleRunLocal() {
-    onRunLocal({ ...buildJdbcAndMongo(), loadMode, engine });
+    onRunLocal({ ...buildJdbcAndMongo(), loadMode, engine, perf: buildPerf() });
   }
 
   function download() {
@@ -126,6 +172,64 @@ export default function GlueJobPreview({
         {loadMode === "scd2" &&
           "Preserves history instead of replacing in place -- a changed or new row gets a fresh current version, its prior version is kept and marked no-longer-current rather than overwritten. Still reads the full source table every run; writes nothing for rows that haven't changed."}
       </p>
+
+      <div style={{ marginTop: 10, marginBottom: 14, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
+        <label style={{ margin: 0 }}>Performance settings (optional)</label>
+        <p className="hint" style={{ marginTop: 2 }}>
+          Four real Spark-submit flags -- driver/executor memory, executor cores, executor
+          instances -- passed identically to a local run of any of the three engines below
+          (Glue, EMR Serverless, EMR on EKS), since all three run via <code>spark-submit</code>.
+          Confirmed live: locally, all three run in <code>local[*]</code> mode (driver and
+          worker are the same single process), so only <strong>driver memory</strong>
+          meaningfully changes what a local run actually does -- executor memory/cores/instances
+          are accepted without error but have little practical effect until the downloaded script
+          is deployed somewhere genuinely distributed, which is exactly why they're also written
+          into that script's docstring as a suggestion. AWS Glue's own job-level
+          WorkerType/NumberOfWorkers sizing is separate, informational-only -- that's a real Glue
+          job's own Console/API setting, not anything this script controls. Leave every field
+          blank to skip this entirely (nothing added to the script or the local run).
+        </p>
+        <button className="btn secondary" style={{ padding: "4px 10px", fontSize: 12 }} onClick={handleSuggestSize} disabled={estimating}>
+          {estimating ? "Estimating…" : "Suggest based on data size"}
+        </button>
+        {sizeHint && <div className="hint" style={{ marginTop: 4 }}>{sizeHint}</div>}
+        {estimateError && (
+          <div className="hint" style={{ color: "var(--sql-amber)", marginTop: 4 }}>
+            Couldn't estimate: {estimateError}
+          </div>
+        )}
+
+        <div className="grid-2" style={{ marginTop: 8 }}>
+          <div>
+            <label>Driver memory</label>
+            <input type="text" placeholder="e.g. 2g" value={driverMemory} onChange={(e) => setDriverMemory(e.target.value)} />
+          </div>
+          <div>
+            <label>Executor memory</label>
+            <input type="text" placeholder="e.g. 4g" value={executorMemory} onChange={(e) => setExecutorMemory(e.target.value)} />
+          </div>
+        </div>
+        <div className="grid-2">
+          <div>
+            <label>Executor cores</label>
+            <input type="text" placeholder="e.g. 2" value={executorCores} onChange={(e) => setExecutorCores(e.target.value)} />
+          </div>
+          <div>
+            <label>Executor instances</label>
+            <input type="text" placeholder="e.g. 2" value={executorInstances} onChange={(e) => setExecutorInstances(e.target.value)} />
+          </div>
+        </div>
+        <div className="grid-2">
+          <div>
+            <label>Glue WorkerType (informational)</label>
+            <input type="text" placeholder="e.g. G.1X" value={glueWorkerType} onChange={(e) => setGlueWorkerType(e.target.value)} />
+          </div>
+          <div>
+            <label>Glue NumberOfWorkers (informational)</label>
+            <input type="text" placeholder="e.g. 4" value={glueNumberOfWorkers} onChange={(e) => setGlueNumberOfWorkers(e.target.value)} />
+          </div>
+        </div>
+      </div>
 
       <div className="grid-2">
         <div>

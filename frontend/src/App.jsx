@@ -156,11 +156,11 @@ export default function App() {
     };
   }, [schema, selectedTableNames]);
 
-  async function handleGenerateGlueJob({ jdbc, mongo, loadMode }) {
+  async function handleGenerateGlueJob({ jdbc, mongo, loadMode, perf }) {
     setError(null);
     setLoading(true);
     try {
-      const result = await api.generateGlueJob({ jdbc, mongo, schema: workingSchema, mapping, loadMode });
+      const result = await api.generateGlueJob({ jdbc, mongo, schema: workingSchema, mapping, loadMode, perf });
       setScript(result.script);
     } catch (err) {
       setError(err.message);
@@ -171,7 +171,7 @@ export default function App() {
 
   // Separate from the generate flow's loading/error/script state so running
   // it locally doesn't clobber (or get clobbered by) the script preview.
-  async function handleRunLocal({ jdbc, mongo, loadMode, engine }) {
+  async function handleRunLocal({ jdbc, mongo, loadMode, engine, perf }) {
     setRunError(null);
     setRunResult(null);
     setRunLoading(true);
@@ -188,6 +188,7 @@ export default function App() {
         mapping,
         loadMode,
         engine,
+        perf,
       });
       setRunResult(result);
     } catch (err) {
@@ -271,6 +272,7 @@ export default function App() {
           <GlueJobPreview
             dbType={dbType}
             connection={connection}
+            workingSchema={workingSchema}
             onGenerate={handleGenerateGlueJob}
             script={script}
             loading={loading}

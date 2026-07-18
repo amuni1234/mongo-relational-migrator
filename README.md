@@ -576,6 +576,45 @@ meant for wherever you actually deploy it) — no need to remember to do that
 switch yourself. No cloud account, no cost, nothing touched besides Docker
 and whatever local database/Mongo you already have running.
 
+### Performance settings (suggested or manual)
+
+The Glue-job step has an optional **"Performance settings"** block above the
+connection fields — four real Spark-submit flags (driver memory, executor
+memory, executor cores, executor instances) applied identically to a local
+run of any of the three engines, since all three fundamentally run via
+`spark-submit`. Leave every field blank to skip this entirely — nothing is
+added to the generated script or the local run, and `generateGlueJob()`'s
+output is untouched.
+
+**Confirmed live: for a local run specifically, only driver memory actually
+matters.** All three engines run in `local[*]` mode locally (driver and
+worker are the same single process, no separate executor JVMs) — executor
+memory/cores/instances are genuinely passed to `spark-submit` and accepted
+without error, but have little practical effect on a local run's actual
+resource usage. They become meaningful once the downloaded script is
+deployed somewhere genuinely distributed (real AWS Glue/EMR) — which is
+exactly why they're also written into that script's docstring as a
+suggestion, not just applied to the local run.
+
+Click **"Suggest based on data size"** to fill them in from a real,
+lightweight query against the source database (not a manual size bucket):
+Postgres's `pg_class.reltuples`/`pg_total_relation_size()`, or MySQL's
+`information_schema.tables.TABLE_ROWS`/`DATA_LENGTH+INDEX_LENGTH`, summed
+across the tables you've actually selected. One real wrinkle worth knowing:
+Postgres's free row-count estimate returns `-1` for a table that's never
+been `ANALYZE`d (true, confirmed, for a freshly-seeded test database) — the
+tool falls back to a real `COUNT(*)` only for tables where that happens, not
+unconditionally. Every suggested field is then freely editable by hand.
+
+**AWS Glue's own real sizing knobs — `WorkerType`/`NumberOfWorkers` — are a
+job-level setting**, configured via the Console/API when the job resource is
+created, not a spark-submit flag and not something this script (or this
+tool, since it doesn't create real cloud resources) can set. A suggested
+WorkerType/NumberOfWorkers pairing is shown as informational text and as a
+comment in the downloadable script, for when you configure the real job
+yourself — it has no effect on the local Glue-engine run, which sizes itself
+via the same four Spark-config fields as the two EMR engines.
+
 ## Roadmap
 
 Five larger items, in rough build order (smallest/most contained first):

@@ -33,4 +33,5 @@ export const api = {
   // Maven package resolution); throws only if the run infrastructure itself
   // failed (Docker missing/unreachable), not if the job ran and failed.
   runLocal: (payload) => post("/run-local", payload),
+  estimateSize: (payload) => post("/estimate-size", payload),
 };

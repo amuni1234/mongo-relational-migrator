@@ -120,9 +120,32 @@ function assertNotPlaceholder(label, value) {
   }
 }
 
-async function runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine }) {
+// These four values get interpolated into a `bash -lc "spark-submit ..."`
+// string executed *inside* the container -- a malformed or malicious value
+// here is a real injection surface into that shell, not just a formatting
+// concern, so every value is checked against a strict allowlist pattern
+// before it's ever allowed near the command string. Same four flags apply
+// to all three engines since all three fundamentally run via spark-submit;
+// Glue's own real job-level WorkerType/NumberOfWorkers sizing is a
+// separate, informational-only suggestion (see sparkConfigSuggester.js) --
+// it has no effect on anything actually executed here.
+const MEMORY_RE = /^\d+[gGmM]$/; // e.g. "2g", "512m"
+const INT_RE = /^\d+$/; // e.g. "2", "4"
+
+function buildSparkPerfFlags(perf) {
+  if (!perf) return "";
+  const { driverMemory, executorMemory, executorCores, executorInstances } = perf;
+  if (!MEMORY_RE.test(driverMemory)) throw new Error(`Invalid driver memory: "${driverMemory}"`);
+  if (!MEMORY_RE.test(executorMemory)) throw new Error(`Invalid executor memory: "${executorMemory}"`);
+  if (!INT_RE.test(String(executorCores))) throw new Error(`Invalid executor cores: "${executorCores}"`);
+  if (!INT_RE.test(String(executorInstances))) throw new Error(`Invalid executor instances: "${executorInstances}"`);
+  return `--driver-memory ${driverMemory} --executor-memory ${executorMemory} --executor-cores ${executorCores} --conf spark.executor.instances=${executorInstances} `;
+}
+
+async function runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine, perf }) {
   assertNotPlaceholder("MongoDB connection URI", mongo.uri);
   assertNotPlaceholder("JDBC URL", jdbc.url);
+  const perfFlags = buildSparkPerfFlags(perf);
 
   const localJdbc = { ...jdbc, url: rewriteHostForDocker(jdbc.url) };
   const localMongo = { ...mongo, uri: rewriteHostForDocker(mongo.uri) };
@@ -160,7 +183,7 @@ async function runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine
         "--entrypoint", "bash",
         EMR_EKS_IMAGE,
         "-lc",
-        `spark-submit --master 'local[*]' --deploy-mode client --packages ${jdbcMavenPackage},${MONGO_SPARK_MAVEN_PACKAGE} ${containerScriptPath}`,
+        `spark-submit --master 'local[*]' --deploy-mode client ${perfFlags}--packages ${jdbcMavenPackage},${MONGO_SPARK_MAVEN_PACKAGE} ${containerScriptPath}`,
       ];
     } else if (engine === "emr-serverless") {
       dockerArgs = [
@@ -171,7 +194,7 @@ async function runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine
         "--entrypoint", "bash",
         EMR_SERVERLESS_IMAGE,
         "-lc",
-        `spark-submit --packages ${jdbcMavenPackage},${MONGO_SPARK_MAVEN_PACKAGE} ${containerScriptPath}`,
+        `spark-submit ${perfFlags}--packages ${jdbcMavenPackage},${MONGO_SPARK_MAVEN_PACKAGE} ${containerScriptPath}`,
       ];
     } else {
       dockerArgs = [
@@ -183,7 +206,7 @@ async function runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine
         "-e", "AWS_DEFAULT_REGION=us-east-1",
         "--entrypoint", "bash",
         GLUE_IMAGE,
-        "-lc", `spark-submit ${containerScriptPath} --JOB_NAME local_run`,
+        "-lc", `spark-submit ${perfFlags}${containerScriptPath} --JOB_NAME local_run`,
       ];
     }
 
