@@ -29,6 +29,18 @@ function bezierPath(fromAnchor, toAnchor, fromSide, toSide, bulge = 60) {
   return `M ${fromAnchor.x} ${fromAnchor.y} C ${c1x} ${fromAnchor.y}, ${c2x} ${toAnchor.y}, ${toAnchor.x} ${toAnchor.y}`;
 }
 
+// A computed column has no real source column, so it can never be a
+// sensible relationship endpoint. ErTableCard.jsx already skips attaching
+// onMouseDown for one (so a drag can't *start* there), but elementFromPoint
+// in handleMouseMove/handleMouseUp below finds whatever DOM node is under
+// the cursor regardless of that -- so a drag started from a real column
+// could still be *dropped* onto a computed one without this second check.
+function isComputedColumn(schema, tableName, columnName) {
+  const table = schema.tables.find((t) => t.name === tableName);
+  const column = table?.columns.find((c) => c.name === columnName);
+  return !!column?.computed;
+}
+
 export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey }) {
   const containerRef = useRef(null);
   const cardRefs = useRef(new Map());
@@ -115,7 +127,8 @@ export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey 
     function handleMouseMove(e) {
       setCursorPos(toContentCoords(e));
       const el = document.elementFromPoint(e.clientX, e.clientY)?.closest("[data-table][data-column]");
-      setHoverTarget(el ? { table: el.dataset.table, column: el.dataset.column } : null);
+      const target = el ? { table: el.dataset.table, column: el.dataset.column } : null;
+      setHoverTarget(target && !isComputedColumn(schema, target.table, target.column) ? target : null);
     }
 
     function handleMouseUp(e) {
@@ -125,7 +138,7 @@ export default function ErDiagram({ schema, onAddForeignKey, onRemoveForeignKey 
         const toTable = el.dataset.table;
         const toColumn = el.dataset.column;
         const isSameRow = toTable === dragStart.table && toColumn === dragStart.column;
-        if (!isSameRow) {
+        if (!isSameRow && !isComputedColumn(schema, toTable, toColumn)) {
           setPendingConnection({
             fromTable: dragStart.table,
             fromColumn: dragStart.column,

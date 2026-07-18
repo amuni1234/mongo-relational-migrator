@@ -206,6 +206,70 @@ a MongoDB type without a human deciding.
   `date`) mapping, since BSON's `Date` is a full instant and Spark's
   `DateType` would otherwise silently drop the time component.
 
+## Computed / derived columns
+
+In the Schema step, "+ Add computed column" on any table lets you add a
+column that isn't read from the source database at all — its value is
+computed at runtime from a Spark SQL expression, referencing that table's
+other real columns by name. An **Operation** dropdown covers the common
+cases without any typing: **Add/Subtract/Multiply/Divide** (pick two numeric
+fields), **Concatenate** (pick two fields of any type), and **Current
+date**/**Current timestamp** (no fields needed). Picking **"Customize"**
+falls back to a free-form expression textarea — with the same column-picker
+and one-click templates as before — for anything the built-in operations
+don't cover. Whichever mode is used, it always ends up as the same one
+expression string passed to pyspark's `expr()`; the operation picker is
+purely a frontend convenience for building that string without typing it
+by hand (and without any risk of misspelling a column name, since the
+built-in operations only ever offer real columns from a dropdown).
+
+Before a column is actually added, click **"Validate & add"** — this runs a
+real, throwaway Spark job (the same local Docker Glue image
+`scripts/test-local-glue.sh` uses) that reads one real row from your actual
+table via JDBC and evaluates the exact expression against it, live. This
+takes several seconds (a Spark cold start) and requires Docker plus your
+database to be reachable from wherever the backend runs, but catches things
+the instant heuristic check can't — a genuine type mismatch, a Spark
+function that doesn't exist, etc. It's a strong nudge, not a hard gate: on
+failure (or if validation itself couldn't run — Docker/DB unreachable) the
+form shows the real error and offers an explicit **"Add anyway"** /
+**"Add without validating"** override, so you're never blocked from adding
+the column.
+
+A few rules and limits worth knowing:
+
+- **A computed column can only reference other real (non-computed) columns
+  already on the same table** — not another computed column, not a column
+  from a different table. This isn't an arbitrary restriction: `expr()`
+  inside the generated script's `.select(...)` resolves against the raw,
+  just-read DataFrame, the same as every other expression in that same
+  select call, so a reference to anything else simply wouldn't exist yet.
+  The Schema step's validator enforces this before you ever get to
+  generation.
+- **Validation is heuristic, not a SQL parser** — it flags an expression
+  that's empty or that references what looks like an unrecognized column
+  name, as a non-blocking warning (it can false-positive on SQL functions
+  it doesn't know about). A column **name** colliding with an existing
+  column on that table *is* a hard block, since that isn't a heuristic risk
+  — it's a guaranteed `AnalysisException: Reference 'x' is ambiguous` at
+  actual Glue runtime. Real correctness of the expression itself can only be
+  confirmed by actually running the generated script in Spark.
+- **Computed columns can't be a primary key, foreign key, or watermark
+  column** — every column picker in the Schema step and the ER diagram
+  excludes them, since none of those make sense for a value that isn't
+  actually stored in the source database.
+- **SCD2 + a non-deterministic expression, on a root-level computed column,
+  is handled** — SCD2 hashes every column to detect changed rows; a
+  computed column with a volatile expression like `CURRENT_TIMESTAMP()`
+  would otherwise hash differently on every run regardless of whether the
+  real underlying row changed, permanently defeating SCD2's "unchanged rows
+  are dropped" behavior. Root-level computed columns are excluded from that
+  hash (their value is still written to the document as normal, just not
+  used for change detection). **This exclusion does not extend to a
+  computed column added on an embedded child table** — avoid volatile
+  expressions there when using SCD2, or every run will look like a change
+  for that parent document.
+
 ## Composite (multi-column) key support
 
 Every foreign key — real or synthetic — is represented as `{ columns: [...],
@@ -460,6 +524,44 @@ What it does:
    your machine (e.g. the disposable Postgres/Mongo containers above).
 4. Leaves the full Spark log at `.local-test/spark_run.log`.
 
+### One-click version, from the UI
+
+The Glue-job step has a **"Run it locally now"** section below the script
+preview — the same mechanism as `scripts/test-local-glue.sh` above, triggered
+by a button instead of a terminal command, with a choice of three local
+Docker engines:
+
+- **Glue** — `amazon/aws-glue-libs:glue_libs_4.0.0_image_01`, exactly what
+  the manual script above uses. Postgres/MySQL JDBC driver and the MongoDB
+  Spark Connector are already bundled.
+- **EMR Serverless** and **EMR on EKS** — AWS's two distinct, official EMR
+  base images (`public.ecr.aws/emr-serverless/spark/emr-7.0.0` and
+  `public.ecr.aws/emr-on-eks/spark/emr-7.0.0`, both pulled from public ECR).
+  There's no single "EMR-local" image the way Glue has one — these are
+  AWS's real base images for its two different EMR deployment products
+  (on-demand serverless vs. a Kubernetes cluster), both confirmed to
+  actually run the generated transformation logic correctly. Neither has
+  the `awsglue` package, so both run a plain-PySpark variant (`SparkSession`
+  instead of `GlueContext`/`Job`) produced by a second local-only transform
+  script, `scripts/make_emr_local_variant.py`; neither bundles the JDBC
+  driver or Mongo connector, so those are resolved from Maven Central via
+  `spark-submit --packages` at run time (meaning the first EMR run of
+  either kind is slower than Glue's, while those packages download). The
+  two also differ from each other in one way worth knowing: EMR Serverless
+  only needs `.master("local[*]")` set inside the script to run locally,
+  while EMR on EKS's `spark-submit` defaults to a real Kubernetes master and
+  cluster deploy mode at the command-line level, so forcing it local also
+  needs explicit `--master`/`--deploy-mode` flags — handled automatically,
+  just worth knowing if you ever run either image yourself outside this
+  tool.
+
+Either way, `localhost`/`127.0.0.1` in the JDBC host or Mongo URI fields is
+rewritten to `host.docker.internal` automatically for this button specifically
+(the "Generate"/"Download" script is left exactly as typed, since that one's
+meant for wherever you actually deploy it) — no need to remember to do that
+switch yourself. No cloud account, no cost, nothing touched besides Docker
+and whatever local database/Mongo you already have running.
+
 ## Roadmap
 
 Five larger items, in rough build order (smallest/most contained first):
@@ -485,16 +587,20 @@ Five larger items, in rough build order (smallest/most contained first):
    Server, Oracle). Each new engine needs its own `information_schema`-
    equivalent introspection queries and JDBC driver wired into the
    generated script.
-4. **Computed/derived columns** — let a user define a column that doesn't
-   exist in the source (concatenating two columns, defaulting to
-   `CURRENT_DATE`, simple expressions), not just pass-through source
-   columns. Needs a small expression model added to the schema shape plus
-   codegen support in `glueJobGenerator.js`.
-5. **Direct cloud deployment** — actually create/run the Glue job (or an
-   EMR/Dataproc equivalent) via AWS/GCP SDKs from this tool, instead of
-   only generating a downloadable script. The largest of the five — real
-   cloud credentials, IAM/service-account wiring, and per-provider
-   deployment logic.
+4. ~~**Computed/derived columns**~~ — **done.** A column that doesn't exist
+   in the source, whose value is instead a free-form Spark SQL expression
+   the user writes in the Schema step (concatenating two columns, defaulting
+   to `CURRENT_DATE()`, or anything else `expr()` supports) — see "Computed
+   / derived columns" below for the full details, validation, and the SCD2
+   interaction to be aware of.
+5. ~~**Direct deployment**~~ — **done, as one-click local execution.** A
+   real cloud SDK integration (creating actual AWS/GCP resources and
+   billed jobs) was scoped and then deliberately dropped in favor of
+   something that fit this tool's zero-cost, locally-verifiable spirit much
+   better: a "Run it locally now" button that actually executes the
+   generated script, for real, via Docker — a choice of AWS's own local Glue
+   4.0 image or its official EMR Serverless base image — with no cloud
+   account and no cost. See "One-click version, from the UI" above.
 
 ## Known gaps
 

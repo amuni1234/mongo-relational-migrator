@@ -142,7 +142,7 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
                 {c.isPrimaryKey ? "🔑 " : ""}
                 {c.name}
               </span>
-              <span className="er-col-type">{c.dataType}</span>
+              <span className="er-col-type">{c.computed ? "computed" : c.dataType}</span>
             </div>
           ))}
         </div>
@@ -181,9 +181,9 @@ export default function MappingCanvas({ schema, onChange, onContinue }) {
             <div className="er-row" key={c.name}>
               <span className={c.isPrimaryKey ? "er-col-pk" : "er-col-name"}>
                 {c.isPrimaryKey ? "🆔 " : ""}
-                {c.isPrimaryKey ? "_id" : c.name}
+                {c.name}
               </span>
-              <span className="er-col-type">{c.dataType}</span>
+              <span className="er-col-type">{c.computed ? "computed" : c.dataType}</span>
             </div>
           ))}
           {children.map((child) => {

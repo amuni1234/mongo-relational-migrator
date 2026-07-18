@@ -24,4 +24,13 @@ export const api = {
   generateGlueJob: (payload) => post("/generate-glue-job", payload),
   testLoad: (payload) => post("/test-load", payload),
   mongoDefaults: () => get("/mongo-defaults"),
+  // Resolves { valid: true } or { valid: false, error } for an expression-
+  // level outcome (both are HTTP 200); throws (via post()'s !res.ok check)
+  // only when validation itself couldn't run at all (Docker/DB unreachable).
+  validateComputedExpression: (payload) => post("/validate-computed-expression", payload),
+  // Resolves { engine, success, log } once the local Docker run finishes
+  // (can take up to a few minutes, especially the EMR engine's first-ever
+  // Maven package resolution); throws only if the run infrastructure itself
+  // failed (Docker missing/unreachable), not if the job ran and failed.
+  runLocal: (payload) => post("/run-local", payload),
 };

@@ -227,11 +227,19 @@
         "type": "object",
         "properties": {
           "name": { "type": "string" },
-          "dataType": { "type": "string" },
+          "dataType": { "type": "string", "nullable": true, "description": "Null for a computed column (see `computed` below) -- it has no source SQL type" },
           "nullable": { "type": "boolean" },
           "isPrimaryKey": { "type": "boolean" },
           "bsonType": { "type": "string", "enum": ["string", "int", "long", "double", "decimal128", "bool", "date"], "description": "Target BSON type for this column, defaulted from dataType by bsonTypeMapper.js and editable by the user in the Schema step" },
-          "bsonTypeConfident": { "type": "boolean", "description": "False when dataType wasn't recognized and the \"string\" fallback was used -- the UI should flag this as a guess rather than a confirmed mapping" }
+          "bsonTypeConfident": { "type": "boolean", "description": "False when dataType wasn't recognized and the \"string\" fallback was used -- the UI should flag this as a guess rather than a confirmed mapping" },
+          "computed": {
+            "type": "object",
+            "nullable": true,
+            "description": "Present only for a column added in the Schema step's \"+ Add computed column\" form -- absent/null (the default) for every column introspect() itself produces. The column's value isn't read from the source table at all; it's evaluated at runtime via pyspark's expr(), which can only reference other real (non-computed) columns already on this same table.",
+            "properties": {
+              "expression": { "type": "string", "description": "A Spark SQL expression string, e.g. \"first_name || ' ' || last_name\" or \"CURRENT_DATE()\"" }
+            }
+          }
         }
       },
       "ForeignKey": {

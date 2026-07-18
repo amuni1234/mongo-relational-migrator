@@ -5,7 +5,24 @@ const DRIVER_BY_TYPE = {
   mysql: "com.mysql.cj.jdbc.Driver",
 };
 
-export default function GlueJobPreview({ dbType, connection, onGenerate, script, loading, error }) {
+const ENGINE_LABELS = {
+  glue: "Glue",
+  "emr-serverless": "EMR Serverless",
+  "emr-eks": "EMR on EKS",
+};
+
+export default function GlueJobPreview({
+  dbType,
+  connection,
+  onGenerate,
+  script,
+  loading,
+  error,
+  onRunLocal,
+  runLoading,
+  runResult,
+  runError,
+}) {
   const [jdbcHost, setJdbcHost] = useState(connection?.host || "");
   const [jdbcPort, setJdbcPort] = useState(String(connection?.port || ""));
   const [jdbcDb, setJdbcDb] = useState(connection?.database || "");
@@ -14,6 +31,7 @@ export default function GlueJobPreview({ dbType, connection, onGenerate, script,
   const [mongoUri, setMongoUri] = useState("mongodb+srv://<cluster-uri>");
   const [mongoDb, setMongoDb] = useState("migrated_db");
   const [loadMode, setLoadMode] = useState("full");
+  const [engine, setEngine] = useState("glue");
 
   function buildJdbcUrl() {
     if (dbType === "postgres") {
@@ -22,8 +40,8 @@ export default function GlueJobPreview({ dbType, connection, onGenerate, script,
     return `jdbc:mysql://${jdbcHost}:${jdbcPort}/${jdbcDb}`;
   }
 
-  function handleGenerate() {
-    onGenerate({
+  function buildJdbcAndMongo() {
+    return {
       jdbc: {
         url: buildJdbcUrl(),
         user: jdbcUser,
@@ -34,8 +52,15 @@ export default function GlueJobPreview({ dbType, connection, onGenerate, script,
         uri: mongoUri,
         database: mongoDb,
       },
-      loadMode,
-    });
+    };
+  }
+
+  function handleGenerate() {
+    onGenerate({ ...buildJdbcAndMongo(), loadMode });
+  }
+
+  function handleRunLocal() {
+    onRunLocal({ ...buildJdbcAndMongo(), loadMode, engine });
   }
 
   function download() {
@@ -129,6 +154,65 @@ export default function GlueJobPreview({ dbType, connection, onGenerate, script,
             </button>
           </div>
           <pre className="code-preview">{script}</pre>
+
+          <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
+            <h3 style={{ margin: "0 0 6px 0" }}>Run it locally now</h3>
+            <p className="hint">
+              Runs this exact script for real, right now, in a local Docker container
+              against whatever Postgres/MySQL and MongoDB the fields above point at
+              (localhost is automatically reached via <code>host.docker.internal</code>)
+              -- no cloud account, no cost. Same mechanism as{" "}
+              <code>scripts/test-local-glue.sh</code>, just one click instead of a
+              terminal. <strong>Glue</strong> uses AWS's own local Glue 4.0 image
+              (Postgres/Mongo drivers bundled). The two <strong>EMR</strong> options run
+              plain PySpark in AWS's official EMR base images, with drivers resolved
+              from Maven on first run (slower than Glue) -- <strong>Serverless</strong>{" "}
+              is EMR's on-demand model, <strong>on EKS</strong> is EMR's Kubernetes-cluster
+              model; both are equally real, just different EMR deployment products, so
+              pick whichever matches what you'd actually run in production.
+            </p>
+
+            <span className="pill-toggle" style={{ marginBottom: 10 }}>
+              <button className={engine === "glue" ? "active" : ""} onClick={() => setEngine("glue")}>
+                Glue (Docker)
+              </button>
+              <button
+                className={engine === "emr-serverless" ? "active" : ""}
+                onClick={() => setEngine("emr-serverless")}
+              >
+                EMR Serverless (Docker)
+              </button>
+              <button className={engine === "emr-eks" ? "active" : ""} onClick={() => setEngine("emr-eks")}>
+                EMR on EKS (Docker)
+              </button>
+            </span>
+
+            <div>
+              <button className="btn" onClick={handleRunLocal} disabled={runLoading}>
+                {runLoading ? "Running… (can take a couple minutes)" : "Run locally now"}
+              </button>
+            </div>
+
+            {runError && (
+              <div className="error-banner" style={{ marginTop: 12 }}>
+                Couldn't run it at all (Docker unavailable, or the run infrastructure
+                failed): {runError}
+              </div>
+            )}
+
+            {runResult && (
+              <div style={{ marginTop: 12 }}>
+                <div className={`status-line ${runResult.success ? "ok" : "error"}`}>
+                  {runResult.success
+                    ? `✓ Ran successfully via ${ENGINE_LABELS[runResult.engine]} -- check your MongoDB collections.`
+                    : `✗ The job ran but failed via ${ENGINE_LABELS[runResult.engine]} -- see the log below.`}
+                </div>
+                <pre className="code-preview" style={{ maxHeight: 300, overflow: "auto" }}>
+                  {runResult.log?.slice(-4000)}
+                </pre>
+              </div>
+            )}
+          </div>
         </>
       )}
     </div>

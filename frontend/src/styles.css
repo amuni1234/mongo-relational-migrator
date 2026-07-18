@@ -342,6 +342,10 @@ pre.code-preview {
   color: var(--mongo-teal);
 }
 
+.status-line.error {
+  color: var(--sql-amber);
+}
+
 /* --- ER-style mapping canvas --- */
 .er-layout {
   display: grid;
@@ -441,9 +445,17 @@ pre.code-preview {
 .er-row {
   display: flex;
   justify-content: space-between;
+  gap: 8px;
   font-family: var(--font-mono);
   font-size: 12px;
   padding: 2px 0;
+}
+
+.er-col-name,
+.er-col-pk {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .er-col-name {
@@ -457,6 +469,12 @@ pre.code-preview {
 
 .er-col-type {
   color: var(--muted);
+  flex-shrink: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
 }
 
 .er-muted {

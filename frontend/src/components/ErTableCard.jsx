@@ -23,13 +23,18 @@ const ErTableCard = forwardRef(function ErTableCard(
             data-table={table.name}
             data-column={c.name}
             ref={(el) => onRowRef?.(c.name, el)}
-            onMouseDown={(e) => onRowMouseDown?.(c.name, e)}
+            // Computed columns have no real source column, so they can
+            // never be a sensible relationship endpoint -- not draggable,
+            // same rule enforced in SchemaTree.jsx's dropdowns.
+            onMouseDown={c.computed ? undefined : (e) => onRowMouseDown?.(c.name, e)}
+            title={c.computed ? "Computed column -- can't be used in a relationship" : undefined}
+            style={c.computed ? { opacity: 0.6, cursor: "default" } : undefined}
           >
             <span className={c.isPrimaryKey ? "er-col-pk" : "er-col-name"}>
               {c.isPrimaryKey ? "🔑 " : ""}
               {c.name}
             </span>
-            <span className="er-col-type">{c.dataType}</span>
+            <span className="er-col-type">{c.computed ? "computed" : c.dataType}</span>
           </div>
         ))}
       </div>

@@ -12,6 +12,15 @@
  *       // `bsonTypeConfident` is false when dataType wasn't recognized and
  *       // the "string" fallback was used.
  *       columns: [{ name, dataType, nullable, isPrimaryKey, bsonType, bsonTypeConfident }],
+ *       // A column may also carry a `computed` property (added by the UI,
+ *       // never set by introspect() itself): { expression: "<Spark SQL>" }.
+ *       // This marks the column as not sourced from the real table at all --
+ *       // its value is derived at runtime via pyspark's expr(), referencing
+ *       // only *other real (non-computed) columns on the same table*. Such
+ *       // a column has `dataType: null` (no source SQL type exists) and is
+ *       // excluded from primary-key/foreign-key/watermark-column selection
+ *       // everywhere in the UI, since none of those make sense for a value
+ *       // that isn't actually stored in the source database.
  *       primaryKey: ["id"],
  *       // `columns`/`refColumns` are always arrays, in corresponding order
  *       // (columns[i] on this table maps to refColumns[i] on refTable) --

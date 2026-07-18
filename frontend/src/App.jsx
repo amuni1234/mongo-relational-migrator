@@ -25,6 +25,9 @@ export default function App() {
   const [selectedTableNames, setSelectedTableNames] = useState(new Set());
   const [mapping, setMapping] = useState(null);
   const [script, setScript] = useState("");
+  const [runLoading, setRunLoading] = useState(false);
+  const [runResult, setRunResult] = useState(null);
+  const [runError, setRunError] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
@@ -88,6 +91,26 @@ export default function App() {
     }));
   }
 
+  function addComputedColumn(tableName, column) {
+    setSchema((prev) => ({
+      ...prev,
+      tables: prev.tables.map((t) =>
+        t.name === tableName ? { ...t, columns: [...t.columns, column] } : t
+      ),
+    }));
+  }
+
+  function removeComputedColumn(tableName, index) {
+    setSchema((prev) => ({
+      ...prev,
+      tables: prev.tables.map((t) =>
+        t.name === tableName
+          ? { ...t, columns: t.columns.filter((_, i) => i !== index) }
+          : t
+      ),
+    }));
+  }
+
   // `null` means "no watermark, always full read for this table" -- the
   // default, so nothing changes unless a user deliberately opts in.
   function setTableWatermarkColumn(tableName, columnName) {
@@ -146,6 +169,34 @@ export default function App() {
     }
   }
 
+  // Separate from the generate flow's loading/error/script state so running
+  // it locally doesn't clobber (or get clobbered by) the script preview.
+  async function handleRunLocal({ jdbc, mongo, loadMode, engine }) {
+    setRunError(null);
+    setRunResult(null);
+    setRunLoading(true);
+    try {
+      // The real script never embeds a plaintext password (it's resolved
+      // from Secrets Manager at runtime) -- but an actual local run needs
+      // one to really connect, so reuse what was already typed at Connect
+      // rather than asking again.
+      const result = await api.runLocal({
+        dbType,
+        jdbc: { ...jdbc, password: connection?.password },
+        mongo,
+        schema: workingSchema,
+        mapping,
+        loadMode,
+        engine,
+      });
+      setRunResult(result);
+    } catch (err) {
+      setRunError(err.message);
+    } finally {
+      setRunLoading(false);
+    }
+  }
+
   function canVisit(key) {
     const idx = STEPS.findIndex((s) => s.key === key);
     if (idx <= stepIndex) return true;
@@ -192,6 +243,8 @@ export default function App() {
           schema={schema}
           workingSchema={workingSchema}
           selectedTableNames={selectedTableNames}
+          dbType={dbType}
+          connection={connection}
           onToggleTable={toggleTableSelection}
           onSelectAllTables={selectAllTables}
           onDeselectAllTables={deselectAllTables}
@@ -199,6 +252,8 @@ export default function App() {
           onRemoveForeignKey={removeSyntheticForeignKey}
           onChangeColumnBsonType={setColumnBsonType}
           onSetWatermarkColumn={setTableWatermarkColumn}
+          onAddComputedColumn={addComputedColumn}
+          onRemoveComputedColumn={removeComputedColumn}
           onContinue={() => setStep("mapping")}
         />
       )}
@@ -220,6 +275,10 @@ export default function App() {
             script={script}
             loading={loading}
             error={error}
+            onRunLocal={handleRunLocal}
+            runLoading={runLoading}
+            runResult={runResult}
+            runError={runError}
           />
           {script && (
             <div style={{ textAlign: "right" }}>

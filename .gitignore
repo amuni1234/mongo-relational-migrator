@@ -6,3 +6,5 @@ build/
 *.log
 .DS_Store
 .local-test/
+__pycache__/
+*.pyc

@@ -3,6 +3,8 @@ const { introspect } = require("../introspect");
 const { suggestMapping } = require("../schemaMapper");
 const { generateGlueJob } = require("../generators/glueJobGenerator");
 const { testLoad } = require("../mongoLoader");
+const { validateComputedExpression } = require("../validateComputedExpression");
+const { runLocal } = require("../runLocal");
 
 const router = express.Router();
 
@@ -88,6 +90,65 @@ router.post("/test-load", async (req, res) => {
       });
     }
     const result = await testLoad({ uri, database, collection, documents });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/validate-computed-expression
+ * body: { dbType, connection: {...driver config}, table, expression, bsonType }
+ * -> { valid: true } | { valid: false, error: "<real Spark error message>" }
+ *
+ * Real dry-run against the user's actual table via a throwaway local Spark
+ * job (same Docker Glue image scripts/test-local-glue.sh uses) -- slower
+ * than a heuristic check (~5-15s Spark cold start) but far more trustworthy.
+ * A 500 here means validation itself couldn't run (Docker/DB unreachable),
+ * not that the expression is wrong -- the frontend treats these two cases
+ * differently ("invalid expression" vs. "couldn't check at all").
+ */
+router.post("/validate-computed-expression", async (req, res) => {
+  try {
+    const { dbType, connection, table, expression, bsonType } = req.body;
+    if (!dbType || !connection || !table || !expression) {
+      return res
+        .status(400)
+        .json({ error: "dbType, connection, table, and expression are all required" });
+    }
+    const result = await validateComputedExpression({ dbType, connection, table, expression, bsonType });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/run-local
+ * body: { dbType, jdbc: {...}, mongo: {...}, schema: {...}, mapping: {...},
+ *         loadMode?, engine: "glue" | "emr-serverless" | "emr-eks" }
+ * -> { engine, success, log }
+ *
+ * One-click version of the manual scripts/test-local-glue.sh workflow --
+ * generates the real script, swaps its Secrets Manager block for a local
+ * env var (and, for "emr", swaps the Glue scaffold for plain PySpark too),
+ * then actually runs it in a local Docker container against whatever
+ * Postgres/MySQL + MongoDB the request's connection info points at
+ * (localhost is automatically rewritten to host.docker.internal). No cloud
+ * credentials, no billing -- purely local. A 500 means the run
+ * infrastructure itself failed (Docker missing/unreachable), not that the
+ * job failed -- a real job failure comes back as 200 with `success: false`
+ * and the log tail explaining why.
+ */
+router.post("/run-local", async (req, res) => {
+  try {
+    const { dbType, jdbc, mongo, schema, mapping, loadMode, engine } = req.body;
+    if (!dbType || !jdbc || !mongo || !schema || !mapping || !engine) {
+      return res
+        .status(400)
+        .json({ error: "dbType, jdbc, mongo, schema, mapping, and engine are all required" });
+    }
+    const result = await runLocal({ dbType, jdbc, mongo, schema, mapping, loadMode, engine });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });

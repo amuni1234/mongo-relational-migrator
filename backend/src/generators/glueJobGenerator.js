@@ -21,6 +21,36 @@ function pythonStr(value) {
   return `"${String(value).replace(/"/g, '\\"')}"`;
 }
 
+// Like pythonStr, but safe for arbitrary hand-typed text (a computed
+// column's Spark SQL expression) rather than the short, predictable
+// identifiers/URLs every other pythonStr call site passes -- a user could
+// reasonably type a backslash (regex literals) or paste a literal line
+// break, either of which pythonStr's quote-only escaping would turn into a
+// broken or misinterpreted Python string literal.
+function pythonExprStr(value) {
+  const escaped = String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r?\n/g, "\\n");
+  return `"${escaped}"`;
+}
+
+// One column's cast/select expression -- a real column reads its own value
+// via col(name); a computed column (added in the UI, never sourced from the
+// real table) instead evaluates a user-authored Spark SQL expression via
+// expr(), which resolves against the raw just-read DataFrame same as every
+// other expression in the same .select() call, so it can only ever see
+// *other real columns already on this table* -- never another computed
+// column (those don't exist yet at this point) and never a column from a
+// different table.
+function columnSelectExpr(column) {
+  const sparkType = bsonTypeToSparkType(column.bsonType);
+  const source = column.computed
+    ? `expr(${pythonExprStr(column.computed.expression)})`
+    : `col(${pythonStr(column.name)})`;
+  return `${source}.cast(${pythonStr(sparkType)}).alias(${pythonStr(column.name)})`;
+}
+
 // Casts every column of a just-read table to its (possibly user-overridden)
 // target BSON type's Spark equivalent, re-aliasing to the same column name
 // so nothing downstream (struct field lists, join-key references) needs to
@@ -30,10 +60,7 @@ function pythonStr(value) {
 // columns in different tables don't end up cast vs. not depending on
 // whether someone happened to touch a dropdown.
 function castSelectLines(varName, table) {
-  const castExprs = table.columns.map((c) => {
-    const sparkType = bsonTypeToSparkType(c.bsonType);
-    return `col(${pythonStr(c.name)}).cast(${pythonStr(sparkType)}).alias(${pythonStr(c.name)})`;
-  });
+  const castExprs = table.columns.map(columnSelectExpr);
   return `${varName} = ${varName}.select(\n    ${castExprs.join(",\n    ")}\n)`;
 }
 
@@ -44,15 +71,19 @@ function sanitizeIdent(name) {
   return name.replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
-// SCD2 needs a few extra pyspark functions the other two modes don't, and
-// watermark filtering needs `max` regardless of mode -- only pulled in
-// when actually needed, so scripts that don't use a feature don't carry
-// its unused imports.
-function pysparkFunctionImports(loadMode, useWatermarks) {
-  const fns = ["collect_list", "struct", "col"];
-  if (loadMode === "scd2") fns.push("sha2", "concat_ws", "current_timestamp", "lit", "array_sort", "expr");
-  if (useWatermarks) fns.push("max");
-  return fns.join(", ");
+// SCD2 needs a few extra pyspark functions the other two modes don't,
+// watermark filtering needs `max` regardless of mode, and any computed
+// column needs `expr` regardless of mode -- only pulled in when actually
+// needed, so scripts that don't use a feature don't carry its unused
+// imports. `expr` can be requested by both SCD2 and computed columns at
+// once, hence the Set -- de-duplicated rather than appearing twice in the
+// generated import line.
+function pysparkFunctionImports(loadMode, useWatermarks, useComputedColumns) {
+  const fns = new Set(["collect_list", "struct", "col"]);
+  if (loadMode === "scd2") ["sha2", "concat_ws", "current_timestamp", "lit", "array_sort", "expr"].forEach((f) => fns.add(f));
+  if (useWatermarks) fns.add("max");
+  if (useComputedColumns) fns.add("expr");
+  return [...fns].join(", ");
 }
 
 // Appended to write_to_mongo's body only when SCD2 is selected -- compares
@@ -61,10 +92,17 @@ function pysparkFunctionImports(loadMode, useWatermarks) {
 // close out their prior version (a partial update, not a replace, so the
 // old document's content is preserved untouched as history) and get a
 // fresh current version inserted.
+//
+// exclude_from_hash_cols leaves a root-level computed column's *value* in
+// the written document as normal, but drops it from the change-detection
+// hash -- a computed column is a pure derivation of other already-hashed
+// real columns, so hashing it too is redundant at best, and actively wrong
+// for a non-deterministic expression (e.g. CURRENT_TIMESTAMP()), which
+// would otherwise make every row look changed on every single run.
 const WRITE_SCD2_FUNCTION = `
 
-def _write_scd2(new_df, collection_name, business_key_cols):
-    content_cols = new_df.columns
+def _write_scd2(new_df, collection_name, business_key_cols, exclude_from_hash_cols=()):
+    content_cols = [c for c in new_df.columns if c not in exclude_from_hash_cols]
     new_df = new_df.withColumn(
         "_contentHash", sha2(concat_ws("||", *[col(c).cast("string") for c in content_cols]), 256)
     )
@@ -210,9 +248,28 @@ function collectionHasAnyWatermark(collection, tableByName) {
   });
 }
 
+// True if any table anywhere in the schema has at least one computed
+// column -- gates the `expr` import, same "only emitted when actually
+// needed" spirit as useWatermarks.
+function schemaHasComputedColumns(schema) {
+  return schema.tables.some((t) => t.columns.some((c) => c.computed));
+}
+
+// Names of computed columns on a collection's *root* table only -- passed
+// to _write_scd2 as exclude_from_hash_cols. Embedded/reference tables'
+// computed columns are deliberately not covered (see WRITE_SCD2_FUNCTION's
+// comment) -- excluding one field from within a nested struct/array's hash
+// contribution isn't worth the complexity this round.
+function rootComputedColumnNames(collection, tableByName) {
+  const rootTable = tableByName.get(collection.rootTable);
+  if (!rootTable) return [];
+  return rootTable.columns.filter((c) => c.computed).map((c) => c.name);
+}
+
 function generateGlueJob({ jdbc, mongo, schema, mapping, loadMode = "full" }) {
   const tableByName = new Map(schema.tables.map((t) => [t.name, t]));
   const useWatermarks = shouldUseWatermarks(schema, loadMode);
+  const useComputedColumns = schemaHasComputedColumns(schema);
 
   const header = `"""
 Auto-generated AWS Glue ETL job.
@@ -254,7 +311,7 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql.functions import ${pysparkFunctionImports(loadMode, useWatermarks)}
+from pyspark.sql.functions import ${pysparkFunctionImports(loadMode, useWatermarks, useComputedColumns)}
 
 args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 sc = SparkContext()
@@ -299,9 +356,9 @@ def read_table(table_name):
     )
 
 
-def write_to_mongo(df, collection_name, id_field_list=None):
+def write_to_mongo(df, collection_name, id_field_list=None, exclude_from_hash_cols=()):
     if LOAD_MODE == "scd2" and id_field_list:
-        _write_scd2(df, collection_name, id_field_list.split(","))
+        _write_scd2(df, collection_name, id_field_list.split(","), exclude_from_hash_cols)
         return
     writer = df.write.format("mongodb")
     if LOAD_MODE == "incremental" and id_field_list:
@@ -496,9 +553,18 @@ function generateCollectionBlock(collection, tableByName, loadMode, useWatermark
     currentVar = joinedVar;
   }
 
+  // Only matters for SCD2 (the only mode that hashes content) -- omitted
+  // entirely otherwise so output stays byte-identical for Full/Incremental
+  // and for any collection with no root-level computed columns.
+  const rootComputedCols = rootComputedColumnNames(collection, tableByName);
+  const excludeHashArg =
+    loadMode === "scd2" && rootComputedCols.length > 0
+      ? `, exclude_from_hash_cols=(${rootComputedCols.map((c) => `${pythonStr(c)},`).join(" ")})`
+      : "";
+
   lines.push("");
   lines.push(
-    `write_to_mongo(${currentVar}, ${pythonStr(collection.collectionName)}, id_field_list=${pythonStr(idFieldListOf(collection.primaryKey))})`
+    `write_to_mongo(${currentVar}, ${pythonStr(collection.collectionName)}, id_field_list=${pythonStr(idFieldListOf(collection.primaryKey))}${excludeHashArg})`
   );
 
   if (watermarkedTables.length > 0) {
@@ -565,4 +631,4 @@ function pluralizeForVar(name) {
   return `${name}s`;
 }
 
-module.exports = { generateGlueJob };
+module.exports = { generateGlueJob, pythonStr, pythonExprStr };
